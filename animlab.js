@@ -120,10 +120,20 @@
     backspace:  { label: 'backspace',   back: true },
     clearText:  { label: 'clear field', wipe: true },
     key:        { label: 'key press',   key: true,   detailHint: 'key name, e.g. Enter' },
+    js:         { label: 'run javascript', js: true, detailHint: 'code, e.g. app.resetBoard()' },
+    wait:       { label: 'wait',        wait: true,  detailHint: 'milliseconds, default 300' },
   };
 
   const snapT = (v, free) => (free ? Math.max(0, v) : Math.max(0, Math.round(v / SNAP) * SNAP));
   const round = (v) => Math.round(v * 1000) / 1000;
+  const hhmmss = (t) => {
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const s = Math.floor(t % 60);
+    const ms = Math.round((t - Math.floor(t)) * 1000);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:` +
+      `${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+  };
   const coerce = (v) => (/^-?\d*\.?\d+$/.test(String(v).trim()) ? parseFloat(v) : v);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const groupHue = (g) => (g * 67) % 360;
@@ -191,7 +201,9 @@
   let laneCount = 1;
   let anims = [];
   let markers = [];
+  let prepMarkers = [];
   let originals = new Map();
+  let baseState = new Map();   // what a property was before animlab first touched it
   let selectedEl = null;
   let selection = new Set();   // "segId:keyId"
   let primary = null;          // { segId, keyId }
@@ -214,6 +226,8 @@
   let downButtons = 0;
   let focusedField = null;
   let autoAdvance = true;
+  let previewOnAdd = true;
+  let preview = null;
   let audioClips = [];        // { id, name, buffer, peaks, offset, inPoint, outPoint }
   let actx = null;            // lazy AudioContext
   let audioGain = null;
@@ -224,6 +238,8 @@
   let takeNo = 0;
   const audioSources = new Map();   // sourceId -> { name, mime, bytes }
   let selectedClip = null;
+  let showTarget = true;
+  let eventsMode = 'play';    // play | render | off
   let recBar = null;
   let mode = 'bottom';        // bottom | top | float
   let popup = null;
@@ -232,9 +248,11 @@
 
   const refOf = (sg, k) => sg.id + ':' + k.id;
   const isEventSeg = (sg) => sg.prop === EVT;
+  const isPrepSeg = (sg) => isEventSeg(sg) && sg.phase === 'prep';
   const segStart = (sg) => (sg.keys.length ? Math.min(...sg.keys.map((k) => k.t)) : 0);
   const segEnd = (sg) => (sg.keys.length ? Math.max(...sg.keys.map((k) => k.t)) : 0);
-  const segLabel = (sg) => `${shortSel(sg.sel)} · ${isEventSeg(sg) ? 'events' : sg.prop}`;
+  const segLabel = (sg) =>
+    `${shortSel(sg.sel)} · ${isPrepSeg(sg) ? 'prep' : isEventSeg(sg) ? 'events' : sg.prop}`;
 
   function selected() {
     const out = [];
@@ -268,18 +286,51 @@
 
   /* ---------- synthetic targets ---------- */
 
-  // absolute, not fixed, so its coordinates are page space and it stays glued
-  // to whatever it was aimed at when the page scrolls
+  /* The cursor sits inside a wrapper that mirrors whatever transform @page is
+     applying to the body. That keeps the cursor's own x and y in untransformed
+     page coordinates, which is the only space in which an element reference
+     can be resolved once and stay correct: a zoom then carries the cursor
+     along with the content it is pointing at, instead of leaving it aimed at
+     where that content used to be. */
+  const cursorSpace = document.createElement('div');
+  cursorSpace.setAttribute('data-animlab', 'cursor-space');
+  cursorSpace.style.cssText =
+    'position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;' +
+    'z-index:2147483644;transform-origin:0 0;';
+  document.documentElement.appendChild(cursorSpace);
+
   const cursor = document.createElement('div');
   cursor.setAttribute('data-animlab', 'cursor');
   cursor.style.cssText =
     'position:absolute;top:0;left:0;width:26px;height:26px;pointer-events:none;' +
-    'z-index:2147483644;transform-origin:4px 3px;opacity:0;';
+    'transform-origin:4px 3px;opacity:0;';
   cursor.innerHTML =
     '<svg viewBox="0 0 26 26" width="26" height="26">' +
     '<path d="M4 2 L4 20 L9 15.5 L12.5 23 L16 21.4 L12.6 14.2 L19 14 Z" ' +
     'fill="#fff" stroke="#111" stroke-width="1.4" stroke-linejoin="round"/></svg>';
-  document.documentElement.appendChild(cursor);
+  cursorSpace.appendChild(cursor);
+
+  // what @page is doing to the body right now
+  function pageTransform() {
+    const st = getComputedStyle(document.body).transform;
+    if (!st || st === 'none') return { x: 0, y: 0, s: 1 };
+    try {
+      const m = new DOMMatrixReadOnly(st);
+      return { x: m.m41, y: m.m42, s: m.a || 1 };
+    } catch (_) { return { x: 0, y: 0, s: 1 }; }
+  }
+
+  function syncCursorSpace() {
+    const t = pageTransform();
+    cursorSpace.style.transform =
+      t.s === 1 && !t.x && !t.y ? 'none' : `translate(${t.x}px, ${t.y}px) scale(${t.s})`;
+  }
+
+  // a rendered page coordinate back into the untransformed space
+  function toUntransformed(x, y) {
+    const t = pageTransform();
+    return { x: round((x - t.x) / t.s), y: round((y - t.y) / t.s) };
+  }
 
   function pageOn() {
     document.body.style.transformOrigin = '0 0';
@@ -292,14 +343,20 @@
   function readValue(sel, prop) {
     const el = resolve(sel);
     if (sel === '@cursor' && (prop === 'x' || prop === 'y')) {
-      const r = cursor.getBoundingClientRect();
-      return prop === 'x' ? round(r.left + window.scrollX) : round(r.top + window.scrollY);
+      // read the transform motion wrote, not the rect: the rect has the page
+      // zoom baked into it, and these coordinates live before that
+      const m = currentXY(cursor);
+      return round(prop === 'x' ? m.x : m.y);
     }
     if (prop === 'opacity') {
       if (!el) return 1;
       const v = parseFloat(getComputedStyle(el).opacity);
       return Number.isNaN(v) ? 1 : v;
     }
+    // the transform on @page is entirely ours, so its rest state is identity.
+    // reading the live matrix here would make a zoom start from wherever the
+    // previous run happened to leave the body.
+    if (sel === '@page' && prop in TRANSFORMS) return TRANSFORMS[prop];
     if ((prop === 'x' || prop === 'y') && el) {
       const m = currentXY(el);
       return round(prop === 'x' ? m.x : m.y);
@@ -333,7 +390,10 @@
   const CURSOR_TIP = { x: 4, y: 3 };
   function offsetToPoint(sel, pt) {
     if (sel === '@cursor') {
-      return { x: round(pt.x - CURSOR_TIP.x), y: round(pt.y - CURSOR_TIP.y) };
+      // the picker reports a rendered page point; the cursor lives before the
+      // page transform, so undo it
+      const u = toUntransformed(pt.x, pt.y);
+      return { x: round(u.x - CURSOR_TIP.x), y: round(u.y - CURSOR_TIP.y) };
     }
     const el = resolve(sel);
     if (!el) return { x: round(pt.x), y: round(pt.y) };
@@ -347,17 +407,21 @@
   // sequence is built, so a window resize or a reflow moves the target with it
   // rather than stranding the cursor at a stale coordinate.
   const DYNAMIC = /^@\((.+)\)$/;
-  const isDynamic = (v) => DYNAMIC.test(String(v).trim());
+  const HOLD = '@hold';
+  const isHold = (v) => String(v).trim() === HOLD;
+  const isDynamic = (v) => DYNAMIC.test(String(v).trim()) || isHold(v);
 
   function resolveDynamic(sel, prop, val) {
     const m = DYNAMIC.exec(String(val).trim());
     if (!m) return val;
     const el = document.querySelector(m[1]);
     if (!el) { console.warn('[animlab] target gone:', m[1]); return 0; }
-    const c = pageCenter(el);
     if (sel === '@cursor') {
-      return round(prop === 'x' ? c.x - CURSOR_TIP.x : c.y - CURSOR_TIP.y);
+      // measured with the page transform lifted, so the answer holds at any zoom
+      const u = untransformedCenter(el);
+      return round(prop === 'x' ? u.cx - CURSOR_TIP.x : u.cy - CURSOR_TIP.y);
     }
+    const c = pageCenter(el);
     // for anything else, work out the translate that lands its own untransformed
     // centre on the target
     const me = resolve(sel);
@@ -515,6 +579,18 @@
   function fireMarker(m) {
     const spec = EVENTS[m.type];
     if (!spec) return;
+
+    if (spec.js) {
+      try {
+        // eslint-disable-next-line no-new-func
+        new Function(m.detail || '')();
+      } catch (err) {
+        console.warn('[animlab] prep script failed:', err.message);
+      }
+      return;
+    }
+
+    if (spec.wait) return;   // only meaningful in a prep run, handled there
 
     if (spec.focus) {
       const el = fieldFor(m.sel) || (aimFor(m.sel) || {}).el;
@@ -777,6 +853,10 @@
         cursor: pointer;
       }
       .segband.events { background: rgba(138,95,176,.10); border-color: rgba(138,95,176,.4); }
+      .segband.prep {
+        background: rgba(214,177,90,.10); border-color: rgba(214,177,90,.5);
+        border-style: dashed;
+      }
       .segband.sel { border-color: rgba(126,224,192,.55); background: rgba(126,224,192,.09); }
       .segband.allsel { border-color: #7ee0c0; background: rgba(126,224,192,.16); }
       .seglabel {
@@ -868,6 +948,7 @@
         <span class="name">animlab</span>
         <button id="pick">pick</button>
         <div class="sel empty" id="sel">nothing selected</div>
+        <button id="hiTarget" class="on" title="outline the target on the page">◉</button>
         <button id="selCursor">@cursor</button>
         <button id="selPage">@page</button>
         <div class="rule"></div>
@@ -921,8 +1002,22 @@
           <button id="addEvent">add</button>
           <button id="fireNow">fire now</button>
           <button id="dragPair">drag pair</button>
+        </div>
+        <div class="pg" style="margin-top:8px">
+          <div class="lbl">fire them</div>
+          <select class="wide" id="evtMode">
+            <option value="play">every time it plays</option>
+            <option value="render">only while rendering</option>
+            <option value="off">never</option>
+          </select>
+        </div>
+        <div class="prow">
           <label class="chk"><input type="checkbox" id="liveMove" checked> pointermove follows cursor</label>
         </div>
+        <div class="hint">a click changes real app state and cannot be rewound the way
+        a tween can. mark a segment as prep in the inspector and it runs before every
+        pass instead of during it, which is where a reset belongs. the run javascript
+        event lets that call into the app itself.</div>
       </div>
 
       <div class="pop" id="popType">
@@ -1105,6 +1200,7 @@
           <button id="seqDel">delete</button>
           <button id="seqExport">export</button>
           <button id="seqImport">import</button>
+          <button id="seqGuides">guides for kdenlive</button>
           <button id="seqClear">new</button>
         </div>
         <div class="hint">exports are a binary .animlab file: cbor with the audio
@@ -1143,6 +1239,7 @@
         <span class="time" id="time">0.00 / 0.00s</span>
         <label class="chk"><input type="checkbox" id="autoreset" checked> reset on end</label>
         <label class="chk"><input type="checkbox" id="autoAdv" checked> auto-advance</label>
+        <label class="chk"><input type="checkbox" id="previewAdd" checked> preview what you add</label>
         <div class="rule"></div>
         <button id="zo">−</button>
         <button id="zi">+</button>
@@ -1529,6 +1626,7 @@
     $('sel').classList.remove('empty');
     $('selCursor').classList.toggle('on', sel === '@cursor');
     $('selPage').classList.toggle('on', sel === '@page');
+    updateTargetBox();
     const f = fieldFor(sel);
     $('typeInfo').textContent = f
       ? `target: <${f.tagName.toLowerCase()}> found, typing will land here`
@@ -1537,6 +1635,7 @@
 
   function startPick() {
     picking = true;
+    updateTargetBox();
     $('pick').classList.add('on');
     $('pick').textContent = 'esc';
     document.addEventListener('mousemove', onMove, true);
@@ -1546,6 +1645,7 @@
   function stopPick() {
     picking = false;
     hi.style.display = 'none';
+    setTimeout(updateTargetBox, 0);
     $('pick').classList.remove('on');
     $('pick').textContent = 'pick';
     document.removeEventListener('mousemove', onMove, true);
@@ -1553,12 +1653,54 @@
   }
 
   $('pick').addEventListener('click', () => (picking ? stopPick() : startPick()));
+  $('hiTarget').addEventListener('click', () => {
+    showTarget = !showTarget;
+    $('hiTarget').classList.toggle('on', showTarget);
+    updateTargetBox();
+  });
   $('selCursor').addEventListener('click', () => setSelected('@cursor'));
   $('selPage').addEventListener('click', () => setSelected('@page'));
 
   /* ---------- point picker ----------
      An eyedropper for coordinates: crosshairs track the pointer, the readout
      shows the page position and what is under it, click to take it.          */
+
+  /* An outline that stays on the current target, so what an "add animation"
+     is about to point at is never a guess. Absolutely positioned in page
+     coordinates so it scrolls with the element for free, and re-measured on
+     every seek so it tracks a @page zoom as it happens. */
+  const targetBox = document.createElement('div');
+  targetBox.setAttribute('data-animlab', 'target');
+  targetBox.style.cssText =
+    'position:absolute;pointer-events:none;z-index:2147483643;display:none;' +
+    'border:1px dashed rgba(126,224,192,.85);background:rgba(126,224,192,.05);' +
+    'border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,.25);';
+  const targetTag = document.createElement('div');
+  targetTag.style.cssText =
+    'position:absolute;left:-1px;top:-17px;font:10px ui-monospace,Menlo,monospace;' +
+    'background:#101418;color:#7ee0c0;border:1px solid #2c343c;border-radius:2px;' +
+    'padding:1px 5px;white-space:nowrap;max-width:340px;overflow:hidden;' +
+    'text-overflow:ellipsis;';
+  targetBox.appendChild(targetTag);
+  document.documentElement.appendChild(targetBox);
+
+  function updateTargetBox() {
+    if (!showTarget || hidden || picking || pickingPoint ||
+        !selectedEl || selectedEl.startsWith('@')) {
+      targetBox.style.display = 'none';
+      return;
+    }
+    const el = resolve(selectedEl);
+    if (!el || !el.getBoundingClientRect) { targetBox.style.display = 'none'; return; }
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) { targetBox.style.display = 'none'; return; }
+    targetBox.style.display = 'block';
+    targetBox.style.left = r.left + window.scrollX + 'px';
+    targetBox.style.top = r.top + window.scrollY + 'px';
+    targetBox.style.width = r.width + 'px';
+    targetBox.style.height = r.height + 'px';
+    targetTag.textContent = shortSel(selectedEl);
+  }
 
   const cross = document.createElement('div');
   cross.setAttribute('data-animlab', 'crosshair');
@@ -1582,6 +1724,7 @@
     const wasHidden = hidden;
     if (!popup) setHidden(true);
     cross.style.display = 'block';
+    updateTargetBox();
 
     const h = cross.querySelector('[data-h]');
     const v = cross.querySelector('[data-v]');
@@ -1624,6 +1767,7 @@
       document.removeEventListener('keydown', key, true);
       cross.style.display = 'none';
       pickingPoint = false;
+      setTimeout(updateTargetBox, 0);
       if (!wasHidden && !popup) setHidden(false);
       if (pt) onPick(pt);
     }
@@ -1639,11 +1783,11 @@
     const gid = nextGid++;
     const to = offsetToPoint(sel, pt);
     addSegment(sel, 'x', [
-      { t: at, val: readValue(sel, 'x'), ease: 'linear' },
+      { t: at, val: HOLD, ease: 'linear' },
       { t: at + dur, val: to.x, ease: 'easeInOut' },
     ], gid);
     addSegment(sel, 'y', [
-      { t: at, val: readValue(sel, 'y'), ease: 'linear' },
+      { t: at, val: HOLD, ease: 'linear' },
       { t: at + dur, val: to.y, ease: 'easeInOut' },
     ], gid);
     if (sel === '@cursor' && !hasSeg('@cursor', 'opacity')) {
@@ -1680,7 +1824,46 @@
   /* ---------- build ---------- */
 
   function remember(el) {
-    if (el && el !== cursor && !originals.has(el)) originals.set(el, el.getAttribute('style'));
+    if (!el || el === cursor || originals.has(el)) return;
+    originals.set(el, el.getAttribute('style'));
+    // recorded before anything animates, which is the whole point: once a
+    // sequence has run, the live value is the end of the animation, not its base
+    const cs = getComputedStyle(el);
+    let m = { x: 0, y: 0, s: 1 };
+    try {
+      if (cs.transform && cs.transform !== 'none') {
+        const mm = new DOMMatrixReadOnly(cs.transform);
+        m = { x: mm.m41, y: mm.m42, s: mm.a || 1 };
+      }
+    } catch (_) { /* leave identity */ }
+    baseState.set(el, {
+      x: round(m.x), y: round(m.y), scale: round(m.s),
+      opacity: parseFloat(cs.opacity) || 0,
+    });
+  }
+
+  /* What a leading @hold resolves to: the property's resting value, not
+     whatever the last playthrough happened to leave behind. Reading the live
+     value here is what made a cursor move play once and then sit still, because
+     on the second build the cursor was already parked on its target. */
+  function restValue(sel, prop) {
+    if (sel === '@cursor') {
+      if (prop === 'opacity') return 0;
+      if (prop in TRANSFORMS) return TRANSFORMS[prop];
+    }
+    if (sel === '@page' && prop in TRANSFORMS) return TRANSFORMS[prop];
+
+    const el = resolve(sel);
+    const base = el && baseState.get(el);
+    if (base) {
+      if (prop === 'x') return base.x;
+      if (prop === 'y') return base.y;
+      if (prop === 'scale' || prop === 'scaleX' || prop === 'scaleY') return base.scale;
+      if (prop === 'opacity') return base.opacity;
+      if (prop in TRANSFORMS) return TRANSFORMS[prop];
+    }
+    // never animated, so the live value still is the base
+    return readValue(sel, prop);
   }
 
   function revert() {
@@ -1695,6 +1878,7 @@
       else el.setAttribute('style', style);
     });
     originals.clear();
+    baseState.clear();
   }
 
   // one motion animation per element+property, merging every segment on it
@@ -1702,15 +1886,23 @@
     revert();
     segs = segs.filter((sg) => sg.keys.length);
     total = 0;
-    segs.forEach((sg) => sg.keys.forEach((k) => { total = Math.max(total, k.t); }));
+    // prep sits outside the timeline: its times only set the running order
+    segs.filter((sg) => !isPrepSeg(sg)).forEach((sg) =>
+      sg.keys.forEach((k) => { total = Math.max(total, k.t); }));
     total = Math.max(total, audioEnd());
     if (total <= 0) total = 0.001;
 
     markers = [];
-    segs.filter(isEventSeg).forEach((sg) => {
+    segs.filter((sg) => isEventSeg(sg) && !isPrepSeg(sg)).forEach((sg) => {
       sg.keys.forEach((k) => markers.push({ t: k.t, type: k.val, detail: k.ease, sel: sg.sel }));
     });
     markers.sort((a, b) => a.t - b.t);
+
+    prepMarkers = [];
+    segs.filter(isPrepSeg).forEach((sg) => {
+      sg.keys.forEach((k) => prepMarkers.push({ t: k.t, type: k.val, detail: k.ease, sel: sg.sel }));
+    });
+    prepMarkers.sort((a, b) => a.t - b.t);
 
     const byTarget = new Map();
     segs.filter((sg) => !isEventSeg(sg)).forEach((sg) => {
@@ -1742,10 +1934,23 @@
         times.push(Math.min(v, 1));
       });
 
+      // resolved in order: @hold takes the value of the point before it, so a
+      // move that gets slid to a different time still starts from wherever the
+      // target actually is by then rather than from a number baked in on the
+      // day it was created
+      let prev = null;
+      const values = pts.map((p) => {
+        const v = isHold(p.val)
+          ? (prev === null ? coerce(restValue(sel, prop)) : prev)
+          : coerce(resolveDynamic(sel, prop, p.val));
+        prev = v;
+        return v;
+      });
+
       try {
         const ctrl = animate(
           target,
-          { [prop]: pts.map((p) => coerce(resolveDynamic(sel, prop, p.val))) },
+          { [prop]: values },
           { duration: total, times, ease: pts.slice(1).map((p) => parseEase(p.ease)) }
         );
         ctrl.pause();
@@ -1769,6 +1974,8 @@
     $('time').textContent = `${time.toFixed(2)} / ${total.toFixed(2)}s`;
     // the take's live block grows with the playhead
     if (recBar && micRec) recBar.style.width = Math.max((time - micRec.at) * pps, 4) + 'px';
+    syncCursorSpace();   // carry the cursor along with a @page zoom
+    updateTargetBox();   // a @page zoom moves the target under it
     emitMove();
   }
 
@@ -1798,7 +2005,9 @@
     }
     t = Math.min(t, total);
     seek(t);
-    markers.forEach((m) => { if (m.t > from && m.t <= t) fireMarker(m); });
+    if (eventsMode === 'play') {
+      markers.forEach((m) => { if (m.t > from && m.t <= t) fireMarker(m); });
+    }
     if (t >= total && !micRec) {
       stop();
       if (resetOnEnd) seek(0);
@@ -1807,13 +2016,16 @@
     raf = requestAnimationFrame(tick);
   }
 
-  function play() {
+  async function play() {
+    cancelPreview();
     // a take starts wherever the playhead is and runs past the end. rewinding
     // to zero because the playhead sits at total is right for review and
     // wrong for recording, and auto-advance parks it at total constantly.
     if (!micRec) {
       if (total <= 0.01) return;
       if (time >= total) seek(0);
+      // starting from the top means re-establishing the starting state
+      if (time <= 0.001) await runPrep();
     }
     focusedField = null;
     scheduleAudio(time);
@@ -1823,7 +2035,27 @@
     raf = requestAnimationFrame(tick);
   }
 
+  /* Events are imperative: a click changes real application state, and unlike
+     a property tween there is nothing to rewind. So instead of pretending a
+     click can be undone, a segment can be marked as prep. Prep fires once
+     before each run, in time order, outside the timeline, and is where you put
+     whatever puts the app back to its starting state. A "run javascript" event
+     makes that reach as far as the app allows. */
+  async function runPrep() {
+    if (!prepMarkers.length || eventsMode === 'off') return;
+    for (const m of prepMarkers) {
+      if (m.type === 'wait') {
+        await wait(parseFloat(m.detail) || 300);
+        continue;
+      }
+      fireMarker(m);
+      await wait(40);   // let the app settle between steps
+    }
+    await wait(60);
+  }
+
   function stop() {
+    cancelPreview();
     playing = false;
     if (raf) cancelAnimationFrame(raf);
     raf = null;
@@ -1834,15 +2066,58 @@
 
   /* ---------- creating segments ---------- */
 
-  // adding something walks the playhead to its end, so the next thing you add
-  // lands after it rather than on top of it
+  /* Play back just the span that was added, so you see the thing you made
+     rather than a playhead jumping over it. Where it lands afterwards is what
+     auto-advance decides: on, it stays at the end ready for the next piece;
+     off, it returns to where you were so you can keep layering at one moment. */
+  function previewRange(a, b, settleAt) {
+    cancelPreview();
+    if (b - a < 0.02) { seek(settleAt); return; }
+    stop();
+    const fired = new Set();
+    seek(a);
+    const started = performance.now();
+    const state = { settleAt, raf: 0 };
+    preview = state;
+
+    const step = (now) => {
+      if (preview !== state) return;
+      const t = Math.min(a + (now - started) / 1000, b);
+      seek(t);
+      if (eventsMode === 'play') {
+        markers.forEach((m, i) => {
+          if (m.t > a && m.t <= t && !fired.has(i)) { fired.add(i); fireMarker(m); }
+        });
+      }
+      if (t >= b) {
+        preview = null;
+        seek(settleAt);
+        return;
+      }
+      state.raf = requestAnimationFrame(step);
+    };
+    state.raf = requestAnimationFrame(step);
+  }
+
+  function cancelPreview() {
+    if (!preview) return;
+    cancelAnimationFrame(preview.raf);
+    preview = null;
+  }
+
   function commit(endT) {
+    const from = time;
     build();
-    if (autoAdvance && typeof endT === 'number') {
-      seek(endT <= time + 1e-6 ? time + MIN_ADVANCE : endT);
-    }
     closePop();
     renderInspector();
+
+    const to = typeof endT === 'number' ? endT : from;
+    const settle = autoAdvance
+      ? (to <= from + 1e-6 ? from + MIN_ADVANCE : to)
+      : from;
+
+    if (previewOnAdd && to > from + 0.02) previewRange(from, to, settle);
+    else seek(settle);
   }
 
   function addSegment(sel, prop, keys, gid) {
@@ -1886,6 +2161,8 @@
   });
 
   /* ---------- events ---------- */
+
+  $('evtMode').addEventListener('change', (e) => { eventsMode = e.target.value; });
 
   $('addEvent').addEventListener('click', () => {
     addSegment(selectedEl || '@cursor', EVT,
@@ -1973,11 +2250,11 @@
     const tx = live ? `@(${selectedEl})` : 500;
     const ty = live ? `@(${selectedEl})` : 400;
     addSegment('@cursor', 'x', [
-      { t: at, val: readValue('@cursor', 'x'), ease: 'linear' },
+      { t: at, val: HOLD, ease: 'linear' },
       { t: at + dur, val: tx, ease: 'easeInOut' },
     ], gid);
     addSegment('@cursor', 'y', [
-      { t: at, val: readValue('@cursor', 'y'), ease: 'linear' },
+      { t: at, val: HOLD, ease: 'linear' },
       { t: at + dur, val: ty, ease: 'easeInOut' },
     ], gid);
     if (!hasSeg('@cursor', 'opacity')) {
@@ -2032,17 +2309,20 @@
     if (!el) return;
     pageOn();
     const s = parseFloat($('zoomAmt').value) || 1.8;
+    // cx and cy are page coordinates. With transform-origin at 0 0 a page
+    // point p lands at x + s*p, and the viewport is showing the window from
+    // scrollX across, so centring it means x = vw/2 + scrollX - s*cx.
     const { cx, cy } = untransformedCenter(el);
     const dur = 0.8;
     const at = time;
     const gid = nextGid++;
     [
-      ['scale', 1, s],
-      ['x', 0, round(window.innerWidth / 2 - s * cx)],
-      ['y', 0, round(window.innerHeight / 2 - s * cy)],
-    ].forEach(([p, from, to]) => {
+      ['scale', s],
+      ['x', round(window.innerWidth / 2 + window.scrollX - s * cx)],
+      ['y', round(window.innerHeight / 2 + window.scrollY - s * cy)],
+    ].forEach(([p, to]) => {
       addSegment('@page', p, [
-        { t: at, val: from, ease: 'linear' },
+        { t: at, val: HOLD, ease: 'linear' },
         { t: at + dur, val: to, ease: 'easeInOut' },
       ], gid);
     });
@@ -2056,12 +2336,8 @@
     const at = time;
     const gid = nextGid++;
     ['scale', 'x', 'y'].forEach((p) => {
-      const prior = segs.filter((s) => s.sel === '@page' && s.prop === p).flatMap((s) => s.keys);
-      const from = prior.length
-        ? prior.sort((a, b) => a.t - b.t)[prior.length - 1].val
-        : (p === 'scale' ? 1 : 0);
       addSegment('@page', p, [
-        { t: at, val: from, ease: 'linear' },
+        { t: at, val: HOLD, ease: 'linear' },
         { t: at + dur, val: p === 'scale' ? 1 : 0, ease: 'easeInOut' },
       ], gid);
     });
@@ -2337,7 +2613,7 @@
 
     const band = document.createElement('div');
     dom.band = band;
-    band.className = 'segband' + (evt ? ' events' : '') +
+    band.className = 'segband' + (evt ? ' events' : '') + (isPrepSeg(sg) ? ' prep' : '') +
       (allSel ? ' sel allsel' : anySel ? ' sel' : '');
     band.style.left = s * pps - 3 + 'px';
     band.style.width = Math.max((e - s) * pps + 6, 20) + 'px';
@@ -2416,9 +2692,11 @@
       if (k.g) node.style.borderColor = `hsl(${groupHue(k.g)} 70% 70%)`;
       node.title = evt
         ? `${round(k.t)}s · ${(EVENTS[k.val] || {}).label || k.val}${k.ease ? ' “' + k.ease + '”' : ''}`
-        : isDynamic(k.val)
-          ? `${round(k.t)}s → follows ${k.val.slice(2, -1)} (now ${resolveDynamic(sg.sel, sg.prop, k.val)})`
-          : `${round(k.t)}s → ${k.val}`;
+        : isHold(k.val)
+          ? `${round(k.t)}s → holds the previous value`
+          : isDynamic(k.val)
+            ? `${round(k.t)}s → follows ${k.val.slice(2, -1)} (now ${resolveDynamic(sg.sel, sg.prop, k.val)})`
+            : `${round(k.t)}s → ${k.val}`;
       if (!evt && isDynamic(k.val)) node.classList.add('dynamic');
       node.addEventListener('mousedown', (ev) => onKeyDown(ev, sg, k));
       lane.appendChild(node);
@@ -2497,6 +2775,7 @@
   // clicking the timeline must pull focus out of any inspector field, or the
   // field keeps swallowing delete and the arrow keys
   function takeTimelineFocus() {
+    cancelPreview();
     const a = root.activeElement;
     if (a && a.blur) a.blur();
     ownField = null;
@@ -2609,9 +2888,11 @@
       let dt = snapT(anchorT0 + (ev.clientX - x0) / pps, ev.altKey) - anchorT0;
       if (minT + dt < 0) dt = -minT;
 
-      // magnetic pull toward the nearest edge, unless shift says otherwise
+      // Magnetic pull, but only once the pointer has actually gone somewhere.
+      // Otherwise whatever the thing already sits on top of, usually the
+      // playhead auto-advance parked there, grabs it back every frame.
       let hit = null;
-      if (!ev.altKey) {
+      if (!ev.altKey && Math.abs(ev.clientX - x0) > 6) {
         const tol = 7 / pps;
         starts.forEach(({ t0 }) => {
           const t = t0 + dt;
@@ -2686,7 +2967,7 @@
       let t = snapT(edge0 + (ev.clientX - x0) / pps, ev.altKey);
 
       let hit = null;
-      if (!ev.altKey) {
+      if (!ev.altKey && Math.abs(ev.clientX - x0) > 6) {
         const tol = 7 / pps;
         targets.forEach((c) => {
           const d = c - t;
@@ -2747,9 +3028,11 @@
         takeTimelineFocus();
         const bundle = getBundle();
         selectBundle({ shiftKey: false, metaKey: false, ctrlKey: false }, bundle);
+        // start the drag before re-rendering, so it never loses the node the
+        // gesture began on
+        beginEdgeScale(ev, bundle, edge);
         renderTracks();
         renderInspector();
-        beginEdgeScale(ev, bundle, edge);
       });
       parent.appendChild(h);
     });
@@ -2830,6 +3113,11 @@
       <div class="block">
         <h4>segment</h4>
         <div class="pg">
+          ${evt ? `<div class="lbl">phase</div>
+          <div class="wide">
+            <label class="chk"><input type="checkbox" id="tPrep"${isPrepSeg(sg) ? ' checked' : ''}>
+              prep: run before every pass, not during</label>
+          </div>` : ''}
           <div class="lbl">target</div>
           <input class="wide" id="tSel" value="${esc(sg.sel)}">
           ${evt ? '' : `
@@ -2853,6 +3141,12 @@
   }
 
   function wireSegBlock(box, sg) {
+    const pr = box.querySelector('#tPrep');
+    if (pr) pr.addEventListener('change', () => {
+      sg.phase = pr.checked ? 'prep' : undefined;
+      build();
+      renderInspector();
+    });
     const si = box.querySelector('#tSel');
     if (si) si.addEventListener('change', () => {
       const v = si.value.trim();
@@ -3037,8 +3331,13 @@
             ${isDynamic(k.val)
               ? '<button id="kFreeze">freeze to a number</button>'
               : '<button id="kFollow">follow an element ⌖</button>'}
+            ${isHold(k.val) ? '' : '<button id="kHold">hold the previous value</button>'}
           </div>
-          ${isDynamic(k.val) ? `<div class="full hint">follows ${esc(k.val.slice(2, -1))}, currently ${resolveDynamic(sg.sel, sg.prop, k.val)}. it re-aims on every rebuild, resize and render.</div>` : ''}` : ''}`}
+          ${isHold(k.val)
+            ? `<div class="full hint">holds whatever came before it on this track, or ${restValue(sg.sel, sg.prop)} if nothing does. that is why a move still starts from the right place after you slide it.</div>`
+            : isDynamic(k.val)
+              ? `<div class="full hint">follows ${esc(k.val.slice(2, -1))}, currently ${resolveDynamic(sg.sel, sg.prop, k.val)}. it re-aims on every rebuild, resize and render.</div>`
+              : ''}` : ''}`}
         </div>
       </div>
       <div class="actions">
@@ -3064,7 +3363,15 @@
     if (kc) kc.addEventListener('input', () => { k.val = kc.value; build(); renderInspector(); });
     const kfz = box.querySelector('#kFreeze');
     if (kfz) kfz.addEventListener('click', () => {
-      k.val = String(resolveDynamic(sg.sel, sg.prop, k.val));
+      k.val = isHold(k.val)
+        ? String(readValue(sg.sel, sg.prop))
+        : String(resolveDynamic(sg.sel, sg.prop, k.val));
+      build();
+      renderInspector();
+    });
+    const kh = box.querySelector('#kHold');
+    if (kh) kh.addEventListener('click', () => {
+      k.val = HOLD;
       build();
       renderInspector();
     });
@@ -3255,7 +3562,7 @@
       version: 4,
       duration: round(total),
       range: range ? { a: range.a, b: range.b } : null,
-      view: { pps: round(pps), ripple, autoAdvance, liveMove, resetOnEnd, takeNo },
+      view: { pps: round(pps), ripple, autoAdvance, previewOnAdd, liveMove, resetOnEnd, takeNo, eventsMode },
       audio: {
         volume: audioGain ? round(audioGain.gain.value * 100) : 100,
         sources: used.map((id) => {
@@ -3274,7 +3581,7 @@
         })),
       },
       segments: segs.map((sg) => ({
-        sel: sg.sel, prop: sg.prop, lane: sg.lane,
+        sel: sg.sel, prop: sg.prop, lane: sg.lane, phase: sg.phase || undefined,
         keys: [...sg.keys].sort((a, b) => a.t - b.t).map((k) => {
           const o = { t: round(k.t), val: k.val, ease: k.ease };
           if (k.g) o.group = k.g;
@@ -3290,7 +3597,7 @@
     const remap = new Map();
     const list = data.segments || data.tracks || [];
     segs = list.map((t) => ({
-      id: nextId++, sel: t.sel, prop: t.prop,
+      id: nextId++, sel: t.sel, prop: t.prop, phase: t.phase,
       lane: typeof t.lane === 'number' ? t.lane : null,
       keys: (t.keys || []).map((k) => {
         const key = { id: nextId++, t: Number(k.t) || 0, val: String(k.val), ease: k.ease || '' };
@@ -3308,9 +3615,13 @@
       pps = data.view.pps || pps;
       ripple = data.view.ripple !== false;
       autoAdvance = data.view.autoAdvance !== false;
+      previewOnAdd = data.view.previewOnAdd !== false;
+      $('previewAdd').checked = previewOnAdd;
       liveMove = data.view.liveMove !== false;
       resetOnEnd = data.view.resetOnEnd !== false;
       takeNo = data.view.takeNo || 0;
+      eventsMode = data.view.eventsMode || 'play';
+      $('evtMode').value = eventsMode;
       $('rRipple').checked = ripple;
       $('autoAdv').checked = autoAdvance;
       $('liveMove').checked = liveMove;
@@ -3445,6 +3756,28 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
     console.log(`[animlab] exported ${(out.bytes.length / 1048576).toFixed(2)} MB as ${out.ext}`);
   });
+  // Kdenlive imports guides from a JSON array of timecodes, so the beats you
+  // built the animation around can land in its timeline as markers
+  $('seqGuides').addEventListener('click', () => {
+    const marks = [];
+    const seen = new Set();
+    const add = (t, comment) => {
+      const key = round(t);
+      if (seen.has(key)) return;
+      seen.add(key);
+      marks.push({ pos: hhmmss(key), comment, type: 0 });
+    };
+    segs.filter((sg) => !isPrepSeg(sg)).forEach((sg) => add(segStart(sg), segLabel(sg)));
+    audioClips.forEach((c) => add(c.offset, c.name));
+    marks.sort((a, b) => a.pos.localeCompare(b.pos));
+    if (!marks.length) { flash($('seqGuides'), 'nothing to mark'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(marks, null, 2)], { type: 'application/json' }));
+    a.download = (($('seqName').value || 'animlab').trim()) + '.guides.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  });
+
   $('seqImport').addEventListener('click', () => $('fileIn').click());
   $('fileIn').addEventListener('change', async (e) => {
     const f = e.target.files && e.target.files[0];
@@ -3790,7 +4123,7 @@
       if (ev.buttons === 0) { up(); return; }
       let t = snapT(Math.max(0, o0 + (ev.clientX - x0) / pps), ev.altKey);
       let hit = null;
-      if (!ev.altKey) {
+      if (!ev.altKey && Math.abs(ev.clientX - x0) > 6) {
         const tol = 7 / pps;
         [t, t + clipLen(c)].forEach((edge) => targets.forEach((cand) => {
           const d = cand - edge;
@@ -3988,6 +4321,7 @@
 
     const fired = new Set();
     stopAudio();
+    await runPrep();
     rec.start();
     await wait(lead * 1000);
 
@@ -3999,9 +4333,11 @@
         if (aborted || rendering === null) return done();
         const t = Math.min((now - started) / 1000, total);
         seek(t);
-        markers.forEach((m, i) => {
-          if (m.t <= t && !fired.has(i)) { fired.add(i); fireMarker(m); }
-        });
+        if (eventsMode !== 'off') {
+          markers.forEach((m, i) => {
+            if (m.t <= t && !fired.has(i)) { fired.add(i); fireMarker(m); }
+          });
+        }
         if (t >= total) return done();
         requestAnimationFrame(step);
       };
@@ -4077,6 +4413,72 @@
     insertAudioGap(range.a, range.b - range.a, $('audRipKeys').checked);
   });
 
+  /* ---------- clipboard ----------
+     Kdenlive puts MLT XML on the clipboard, not audio. It names the source
+     file and its in and out points, and a browser cannot open a local path,
+     so the audio itself still has to be dropped in. What the XML is good for
+     is the timing: we read the in/out and set the range to match, and print
+     the path so you know which file to drag over. Pasting an actual audio
+     file or a URL loads it directly. */
+  function timecodeToSeconds(tc) {
+    const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/.exec(String(tc).trim());
+    if (!m) return parseFloat(tc) || 0;
+    return (+(m[1] || 0)) * 3600 + (+m[2]) * 60 + (+m[3]) + (+(m[4] || 0)) / 1000;
+  }
+
+  function readMltXml(text) {
+    let doc;
+    try { doc = new DOMParser().parseFromString(text, 'application/xml'); } catch (_) { return null; }
+    if (doc.querySelector('parsererror')) return null;
+    const entry = doc.querySelector('entry[in], entry[out]');
+    const resource = [...doc.querySelectorAll('property[name="resource"]')]
+      .map((p) => p.textContent.trim()).filter(Boolean)[0];
+    if (!entry && !resource) return null;
+    return {
+      resource,
+      in: entry ? timecodeToSeconds(entry.getAttribute('in')) : 0,
+      out: entry ? timecodeToSeconds(entry.getAttribute('out')) : 0,
+    };
+  }
+
+  document.addEventListener('paste', async (e) => {
+    if (hidden) return;
+    const dt = e.clipboardData;
+    if (!dt) return;
+
+    const file = [...(dt.files || [])].find((f) => f.type.startsWith('audio/'));
+    if (file) { e.preventDefault(); await loadAudioFile(file); return; }
+
+    const text = (dt.getData('text/plain') || '').trim();
+    if (!text) return;
+
+    if (/^https?:\/\/\S+\.(wav|mp3|ogg|flac|m4a|opus|webm)(\?|$)/i.test(text)) {
+      e.preventDefault();
+      try {
+        const res = await fetch(text);
+        const blob = await res.blob();
+        await loadAudioFile(new File([blob], text.split('/').pop().split('?')[0], { type: blob.type }));
+      } catch (err) {
+        console.warn('[animlab] could not fetch that audio:', err.message);
+      }
+      return;
+    }
+
+    if (text.includes('<mlt') || text.includes('<producer') || text.includes('<playlist')) {
+      const clip = readMltXml(text);
+      if (!clip) return;
+      e.preventDefault();
+      if (clip.out > clip.in) {
+        setRange(round(clip.in), round(clip.out));
+        console.log(`[animlab] range set to the pasted clip: ${round(clip.in)}s to ${round(clip.out)}s`);
+      }
+      if (clip.resource) {
+        console.log('[animlab] that clip is', clip.resource, '- drag the file in to hear it');
+        $('audInfo').textContent = 'pasted timing. drag in: ' + clip.resource.split('/').pop();
+      }
+    }
+  }, true);
+
   // dropping a clip anywhere on the timeline loads it at the playhead
   ['dragover', 'drop'].forEach((n) => $('tl').addEventListener(n, (e) => {
     e.preventDefault();
@@ -4139,6 +4541,8 @@
 
   function setHidden(v) {
     hidden = v;
+    if (v) targetBox.style.display = 'none';
+    else setTimeout(updateTargetBox, 0);
     // important, so a page stylesheet reaching into the host cannot override it
     if (v) host.style.setProperty('display', 'none', 'important');
     else host.style.removeProperty('display');
@@ -4200,8 +4604,10 @@
   $('reset').addEventListener('click', () => { stop(); seek(0); });
   $('autoreset').addEventListener('change', (e) => (resetOnEnd = e.target.checked));
   $('autoAdv').addEventListener('change', (e) => (autoAdvance = e.target.checked));
+  $('previewAdd').addEventListener('change', (e) => (previewOnAdd = e.target.checked));
   $('ruler').addEventListener('mousedown', (e) => {
     stop();
+    cancelPreview();
     const go = (ev) => {
       const r = $('ruler').getBoundingClientRect();
       seek((ev.clientX - r.left) / pps);
@@ -4380,9 +4786,11 @@
   });
 
   let resizeTimer = null;
+  window.addEventListener('scroll', updateTargetBox, { passive: true, capture: true });
   window.addEventListener('resize', () => {
     if (!popup) applyMode();
     // element references resolve against layout, so refresh them once it settles
+    updateTargetBox();
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       if (segs.some((sg) => sg.keys.some((k) => isDynamic(k.val)))) build();
@@ -4495,7 +4903,7 @@
       unbindDoc(document);
       if (popup && !popup.closed) { try { unbindDoc(popup.document); } catch (_) {} popup.close(); }
       popup = null;
-      cursor.remove(); hi.remove(); cross.remove(); host.remove();
+      cursorSpace.remove(); hi.remove(); cross.remove(); targetBox.remove(); host.remove();
       delete window.__animLab;
     },
   };
