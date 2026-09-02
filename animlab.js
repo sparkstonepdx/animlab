@@ -27,38 +27,58 @@
     return;
   }
 
-  /* ---------- motion.dev ---------- */
+   /* ---------- motion.dev ---------- */
+
+  function injectScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = res;
+      s.onerror = () => rej(new Error('blocked: ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function loadUMD(url, globalName) {
+    if (window[globalName]) return window[globalName];
+    try {
+      await injectScript(url);
+    } catch (_) {
+      const src = await (await fetch(url)).text();
+      const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      try { await injectScript(blobUrl); } finally { URL.revokeObjectURL(blobUrl); }
+    }
+    return window[globalName];
+  }
 
   let M;
   try {
     M = await import('https://cdn.jsdelivr.net/npm/motion@12/+esm');
   } catch (e1) {
     try {
-      await new Promise((res, rej) => {
-        const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/motion@12/dist/motion.js';
-        s.onload = res;
-        s.onerror = rej;
-        document.head.appendChild(s);
-      });
-      M = window.Motion;
+      M = await loadUMD('https://cdn.jsdelivr.net/npm/motion@12/dist/motion.js', 'Motion');
+      if (!M) throw new Error('loaded but exported no Motion global');
     } catch (e2) {
       console.error(
-        '[animlab] could not load motion.dev. The page CSP is blocking jsDelivr.\n' +
-        'Load it via a userscript manager (@require) or a DevTools local override.'
+        '[animlab] could not load motion.dev:', e2.message, '\n' +
+        'The page CSP blocks jsDelivr and blob: scripts too. Override the ' +
+        'Content-Security-Policy response header in DevTools, or load this ' +
+        'via a userscript manager @require.'
       );
       return;
     }
   }
   const { animate } = M;
 
-  // cbor-x arrives the same way. A failure here only costs the binary save
-  // format, so it warns and carries on rather than taking the tool down.
   let cborLib = null;
   try {
     cborLib = await import('https://cdn.jsdelivr.net/npm/cbor-x@1/+esm');
   } catch (err) {
-    console.warn('[animlab] cbor-x unavailable, saves will use json:', err.message);
+    try {
+      cborLib = await loadUMD('https://cdn.jsdelivr.net/npm/cbor-x@1/dist/index.js', 'CBOR');
+    } catch (err2) {
+      console.warn('[animlab] cbor-x unavailable, saves will use json:', err2.message);
+    }
   }
 
   /* ---------- constants ---------- */
