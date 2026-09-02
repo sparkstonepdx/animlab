@@ -52,10 +52,21 @@
   }
   const { animate } = M;
 
+  // cbor-x arrives the same way. A failure here only costs the binary save
+  // format, so it warns and carries on rather than taking the tool down.
+  let cborLib = null;
+  try {
+    cborLib = await import('https://cdn.jsdelivr.net/npm/cbor-x@1/+esm');
+  } catch (err) {
+    console.warn('[animlab] cbor-x unavailable, saves will use json:', err.message);
+  }
+
   /* ---------- constants ---------- */
 
   const SNAP = 0.05;
   const MIN_ADVANCE = 0.25;   // how far a zero-length item nudges the playhead
+  const AUDIO_H = 46;
+  const PEAKS_PER_SEC = 200;
   const GUTTER = 54;
   const RULER_H = 22;
   const RANGE_H = 14;
@@ -203,6 +214,17 @@
   let downButtons = 0;
   let focusedField = null;
   let autoAdvance = true;
+  let audioClips = [];        // { id, name, buffer, peaks, offset, inPoint, outPoint }
+  let actx = null;            // lazy AudioContext
+  let audioGain = null;
+  let audioDest = null;       // tap for the video recorder
+  let liveSources = [];       // scheduled AudioBufferSourceNodes
+  let audioAnchor = null;     // { ctxStart, timeStart } while playing
+  let micRec = null;          // an in-progress take
+  let takeNo = 0;
+  const audioSources = new Map();   // sourceId -> { name, mime, bytes }
+  let selectedClip = null;
+  let recBar = null;
   let mode = 'bottom';        // bottom | top | float
   let popup = null;
   let floatBox = { x: 60, y: 60, w: 900, h: 340 };
@@ -318,6 +340,33 @@
     const c = pageCenter(el);
     const cur = currentXY(el);
     return { x: round(cur.x + (pt.x - c.x)), y: round(cur.y + (pt.y - c.y)) };
+  }
+
+  // A keyframe value may be a live reference like @(#some-button) instead of a
+  // number. It resolves to that element's current position every time the
+  // sequence is built, so a window resize or a reflow moves the target with it
+  // rather than stranding the cursor at a stale coordinate.
+  const DYNAMIC = /^@\((.+)\)$/;
+  const isDynamic = (v) => DYNAMIC.test(String(v).trim());
+
+  function resolveDynamic(sel, prop, val) {
+    const m = DYNAMIC.exec(String(val).trim());
+    if (!m) return val;
+    const el = document.querySelector(m[1]);
+    if (!el) { console.warn('[animlab] target gone:', m[1]); return 0; }
+    const c = pageCenter(el);
+    if (sel === '@cursor') {
+      return round(prop === 'x' ? c.x - CURSOR_TIP.x : c.y - CURSOR_TIP.y);
+    }
+    // for anything else, work out the translate that lands its own untransformed
+    // centre on the target
+    const me = resolve(sel);
+    if (!me) return 0;
+    const prev = me.style.transform;
+    me.style.transform = 'none';
+    const rest = pageCenter(me);
+    me.style.transform = prev;
+    return round(prop === 'x' ? c.x - rest.x : c.y - rest.y);
   }
 
   const hasSeg = (sel, prop) => segs.some((s) => s.sel === sel && s.prop === prop && s.keys.length);
@@ -618,7 +667,7 @@
 
       /* popovers */
       .pop {
-        position: absolute; z-index: 30; display: none; pointer-events: auto;
+        position: fixed; z-index: 2147483647; display: none; pointer-events: auto;
         background: #141a20; border: 1px solid #2c343c; border-radius: 4px;
         padding: 10px; min-width: 250px; max-width: 420px;
         max-height: 60vh; overflow-y: auto;
@@ -687,6 +736,39 @@
         display: flex; align-items: center; justify-content: center;
         font-size: 10px; color: #47525c;
       }
+      .audiorow { display: flex; }
+      .audiocell {
+        width: ${GUTTER}px; flex: none; height: ${AUDIO_H}px; position: sticky; left: 0; z-index: 4;
+        background: #0c1013; border-right: 1px solid #232a31; border-bottom: 1px solid #232a31;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 9px; color: #3f7f96;
+      }
+      .audiolane {
+        height: ${AUDIO_H}px; position: relative; flex: none;
+        background: #0a0e11; border-bottom: 1px solid #232a31; cursor: grab;
+      }
+      .audiolane.sliding { cursor: grabbing; }
+      .audiolane canvas { display: block; position: absolute; top: 0; left: 0; }
+      .aclip {
+        position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
+        border: 1px solid rgba(63,127,150,.65); background: rgba(63,127,150,.10);
+        cursor: grab; overflow: hidden;
+      }
+      .aclip:hover { border-color: #5cb4d0; }
+      .aclip.sel { border-color: #7ee0c0; background: rgba(126,224,192,.12); }
+      .aclip .nm {
+        position: absolute; top: 1px; left: 4px; font-size: 9px;
+        color: #7d95a3; pointer-events: none; white-space: nowrap;
+      }
+      .arec {
+        position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
+        background: rgba(220,80,80,.18); border: 1px solid #b85454;
+        pointer-events: none;
+      }
+      .arec .dot {
+        position: absolute; left: 5px; top: 50%; width: 7px; height: 7px;
+        margin-top: -3px; border-radius: 50%; background: #e06a6a;
+      }
       .lane { height: ${LANE_H}px; position: relative; border-bottom: 1px solid #161b20; background: #0b0f12; flex: none; }
 
       .segband {
@@ -704,11 +786,28 @@
       .segband.events + .seglabel, .seglabel.events { color: #9b86b5; }
 
       .seg { position: absolute; top: 65%; height: 2px; background: #2c5866; transform: translateY(-50%); pointer-events: none; }
+      /* z-index 5 puts the bar above .key (4). At 3 it made its own stacking
+         context and trapped the handles underneath the keyframes that sit on
+         its edges by definition, so they could never be grabbed. */
       .glink {
-        position: absolute; bottom: 2px; height: 4px; border-radius: 2px;
-        cursor: grab; opacity: .85; z-index: 3;
+        position: absolute; bottom: 1px; height: 5px; border-radius: 2px;
+        cursor: grab; opacity: .85; z-index: 5;
       }
-      .glink:hover { opacity: 1; height: 5px; }
+      .glink:hover { opacity: 1; height: 6px; }
+      .gh {
+        position: absolute; top: -5px; bottom: -3px; width: 9px;
+        cursor: ew-resize; z-index: 6; border-radius: 2px;
+      }
+      .gh.l { left: -5px; }
+      .gh.r { right: -5px; }
+      .gh:hover { background: rgba(255,255,255,.5); }
+      .sbh {
+        position: absolute; top: 0; bottom: 0; width: 8px;
+        cursor: ew-resize; z-index: 6;
+      }
+      .sbh.l { left: 0; border-radius: 3px 0 0 3px; }
+      .sbh.r { right: 0; border-radius: 0 3px 3px 0; }
+      .sbh:hover { background: rgba(126,224,192,.3); }
       .key {
         position: absolute; top: 65%; width: 11px; height: 11px;
         margin: -6px 0 0 -6px; background: #4a9db8; border: 1px solid #7ec4dc;
@@ -723,6 +822,8 @@
       }
       .key.event.selected { background: #d0aff0; border-color: #f0e2ff; }
       .key.mini { width: 7px; height: 7px; margin: -4px 0 0 -4px; }
+      .key.dynamic { background: #b8934a; border-color: #e0c47e; }
+      .key.dynamic.selected { background: #e0c47e; border-color: #fff0c8; }
       .evt-label {
         position: absolute; top: 65%; transform: translateY(-50%);
         font-size: 9px; color: #9b86b5; pointer-events: none; white-space: nowrap;
@@ -777,6 +878,7 @@
         <button data-pop="popCamera">cursor &amp; zoom ▾</button>
         <button data-pop="popRange">range ▾</button>
         <button data-pop="popFile">file ▾</button>
+        <button data-pop="popAudio">audio ▾</button>
         <button data-pop="popRender">render ▾</button>
         <button data-pop="popDock">layout ▾</button>
         <span class="spacer"></span>
@@ -901,6 +1003,43 @@
         <div class="hint">drag the amber strip to set a range, drag its handles to scale what is inside</div>
       </div>
 
+      <div class="pop" id="popAudio">
+        <h4>record a take, or drop a clip in</h4>
+        <div class="prow">
+          <button class="go" id="audRec">record from the playhead</button>
+          <button id="audPick">load a file</button>
+          <button id="audClear" hidden>remove all</button>
+        </div>
+        <div class="prow">
+          <label class="chk"><input type="checkbox" id="audPlayWhileRec" checked>
+            play the sequence while recording</label>
+        </div>
+        <div class="prow">
+          <button id="audSlice">slice at the playhead</button>
+          <button id="audSliceRange">slice at both range edges</button>
+          <button id="audDelClip">delete the selected clip</button>
+        </div>
+        <h4 style="margin-top:12px">edit the highlighted range</h4>
+        <div class="prow">
+          <button id="audCut">cut it out and close the gap</button>
+          <button id="audLift">silence it, leave the gap</button>
+        </div>
+        <div class="prow">
+          <button id="audGap">open a gap here</button>
+          <label class="chk"><input type="checkbox" id="audRipKeys">
+            move keyframes too</label>
+        </div>
+        <div class="pg" style="margin-top:10px">
+          <div class="lbl">volume</div>
+          <input id="audVol" value="100">
+          <div class="lbl">percent</div>
+        </div>
+        <div class="hint" id="audInfo">no audio yet</div>
+        <div class="hint">s slices at the playhead, delete removes the selected clip.
+        set a range with the amber strip to cut. drag a clip to slide it, or grab its
+        edges to trim. wear headphones for a take, or playback bleeds into the mic.</div>
+      </div>
+
       <div class="pop" id="popRender">
         <h4>record the sequence and download it</h4>
         <div class="pg">
@@ -923,6 +1062,9 @@
           <input id="rvTail" value="0.5" title="tail">
         </div>
         <div class="prow">
+          <label class="chk"><input type="checkbox" id="rvHidePanel" checked> hide the panel while recording</label>
+        </div>
+        <div class="prow">
           <button class="go" id="rvGo">record and download</button>
           <button id="rvStop" hidden>stop</button>
         </div>
@@ -943,6 +1085,10 @@
           <button class="go" id="dockPopOut">pop out to a window</button>
           <button id="dockPopIn">bring back</button>
         </div>
+        <div class="prow">
+          <label class="chk"><input type="checkbox" id="guardChk" checked>
+            hold focus against page dialogs</label>
+        </div>
         <div class="hint">float drags by the toolbar and resizes from the bottom right corner. h hides it entirely.</div>
       </div>
 
@@ -954,6 +1100,12 @@
           <select id="seqList"><option value="">saved…</option></select>
         </div>
         <div class="prow">
+          <label class="chk"><input type="checkbox" id="seqEmbed" checked>
+            include audio</label>
+          <label class="chk"><input type="checkbox" id="seqJson">
+            readable json instead of binary</label>
+        </div>
+        <div class="prow">
           <button id="seqSave">save</button>
           <button id="seqLoad">load</button>
           <button id="seqDel">delete</button>
@@ -961,6 +1113,9 @@
           <button id="seqImport">import</button>
           <button id="seqClear">new</button>
         </div>
+        <div class="hint">exports are a binary .animlab file: cbor with the audio
+        as raw bytes, about a third smaller than json and quicker to read. tick
+        readable json if you want to inspect or diff one. both load back.</div>
         <div class="out">
           <button id="copy">copy motion code</button>
           <textarea id="output" readonly spellcheck="false"></textarea>
@@ -998,13 +1153,14 @@
         <button id="zo">−</button>
         <button id="zi">+</button>
         <span class="spacer"></span>
-        <span class="hint">shift-click keyframes, bands or group bars to build a selection · alt for free timing · h hide · space play · g group · r range</span>
+        <span class="hint">shift-click to multi-select · drag a band edge to stretch · s slices audio · alt for free timing · h hide · space play · g group · r range</span>
       </div>
       <div class="fresize" id="fresize"></div>
     </div>
 
     <div class="marquee" id="marquee"></div>
-    <input type="file" id="fileIn" accept="application/json" style="display:none">
+    <input type="file" id="fileIn" accept=".animlab,.json,application/json,application/octet-stream" style="display:none">
+    <input type="file" id="audIn" accept="audio/*" style="display:none">
     <datalist id="eases">${EASES.map((e) => `<option value="${e}">`).join('')}</datalist>
   `;
 
@@ -1089,37 +1245,152 @@
 
   const fromUs = (e) => e.composedPath().includes(host);
 
-  // note: no mouseup or pointerup here. Every drag ends on a window-level
-  // listener, so swallowing the release at the host leaves drags stuck on.
-  ['pointerdown', 'mousedown', 'touchstart', 'click', 'focusin', 'focusout']
+  // Pointer events are shielded on the way OUT, at the host, after our own
+  // handlers have run. Stopping them on the way in would kill our own drags.
+  ['pointerdown', 'mousedown', 'touchstart', 'click']
     .forEach((name) => {
       host.addEventListener(name, (e) => { if (guardFocus) e.stopPropagation(); });
     });
 
-  root.addEventListener('focusin', (e) => {
-    const t = e.composedPath()[0];
-    if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) {
-      ownField = t;
-      reclaims = 0;
-    }
+  // Focus events are different, and this is what the last attempt got wrong.
+  // Focus traps listen at document CAPTURE, which runs before the event ever
+  // reaches our host, so a shield at the host is too late and the trap yanks
+  // focus straight back. Nothing inside the panel needs these events to
+  // descend, so we can safely kill them at document capture instead, doing our
+  // own bookkeeping first. 'focus' and 'blur' do not bubble but do capture,
+  // so they have to be listed too.
+  ['focusin', 'focusout', 'focus', 'blur'].forEach((name) => {
+    document.addEventListener(name, (e) => {
+      if (!guardFocus || !fromUs(e)) return;
+      if (name === 'focusin' || name === 'focus') {
+        const t = e.composedPath()[0];
+        if (t && t.nodeType === 1 && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) {
+          ownField = t;
+          reclaims = 0;
+        }
+      }
+      // keep the page's focus machinery from ever learning about our panel
+      e.stopImmediatePropagation();
+    }, true);
   });
 
-  // if a trap steals focus straight back out, take it again a couple of times
+  // belt and braces: if something still drags focus away, take it back
   document.addEventListener('focusin', (e) => {
     if (!guardFocus || !ownField || !ownField.isConnected) return;
     if (fromUs(e)) return;
-    if (reclaims++ > 3) return;
+    if (reclaims++ > 6) return;
     requestAnimationFrame(() => {
-      if (ownField && ownField.isConnected) ownField.focus({ preventScroll: true });
+      if (ownField && ownField.isConnected && root.activeElement !== ownField) {
+        ownField.focus({ preventScroll: true });
+      }
     });
   }, true);
 
-  root.addEventListener('focusout', (e) => {
-    const next = e.relatedTarget;
-    if (next && root.contains(next)) return;
-    setTimeout(() => {
-      if (root.activeElement == null) ownField = null;
-    }, 0);
+  /* ---------- the part that actually wins ----------
+     Everything above depends on our listener running before the dialog's, and
+     for listeners on the same node in the same phase that comes down to who
+     registered first. A dialog that opened before this tool loaded always wins
+     that race, which is why shielding events was never enough.
+
+     So intercept the one thing every focus trap has to do in the end: call
+     .focus() on something. While a field in our panel holds focus, calls
+     aimed anywhere outside it are ignored. The condition is self-limiting.
+     Click away and root.activeElement stops being one of our fields, so the
+     page goes straight back to behaving normally.                            */
+
+  const panelHasTextFocus = () => {
+    const a = root.activeElement;
+    return !!a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+  };
+
+  /* The guard used to arm only once one of our fields already held focus, and
+     there is a window before that where it does not. Pressing a field runs the
+     trap's document-capture pointerdown handler BEFORE the browser's default
+     action moves focus, so at that instant root.activeElement is still null,
+     the guard is asleep, and the trap takes focus unopposed.
+
+     So arm on engagement instead of on focus: pressing anywhere in the panel
+     claims focus ownership, pressing anywhere else gives it back. */
+  let panelEngaged = false;
+  root.addEventListener('pointerdown', () => { panelEngaged = true; }, true);
+  root.addEventListener('mousedown', () => { panelEngaged = true; }, true);
+  const releaseFocus = (e) => {
+    if (fromUs(e)) return;
+    panelEngaged = false;
+    // let go of our own field too, or panelHasTextFocus keeps the guard armed
+    // and the page can never take focus back
+    const a = root.activeElement;
+    if (a && a.blur) a.blur();
+    ownField = null;
+  };
+  document.addEventListener('pointerdown', releaseFocus, true);
+  document.addEventListener('mousedown', releaseFocus, true);
+
+  const panelOwnsFocus = () => guardFocus && (panelEngaged || panelHasTextFocus());
+
+  const patchedFocus = new Map();
+  [window.HTMLElement, window.SVGElement].forEach((ctor) => {
+    if (!ctor || typeof ctor.prototype.focus !== 'function') return;
+    const proto = ctor.prototype;
+    const native = proto.focus;
+    patchedFocus.set(proto, native);
+    proto.focus = function patchedFocusFn(...args) {
+      if (panelOwnsFocus() &&
+          this !== host && this.getRootNode && this.getRootNode() !== root) {
+        return undefined;   // a focus trap reaching for the page. not today.
+      }
+      return native.apply(this, args);
+    };
+  });
+
+  function restoreFocusPatch() {
+    patchedFocus.forEach((native, proto) => { proto.focus = native; });
+    patchedFocus.clear();
+  }
+
+  /* ---------- focus our own fields explicitly ----------
+     A field gets focus from the browser's default action on mousedown. Any
+     page listener at document CAPTURE that calls preventDefault kills that
+     default before the event ever reaches us, and WebGL canvases and modal
+     overlays both do exactly that to suppress text selection and dragging.
+     Nothing we do at the host can undo it, because it already happened.
+     So stop relying on the default and focus the field ourselves.            */
+
+  const isField = (el) =>
+    !!el && el.nodeType === 1 && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) && !el.disabled;
+
+  ['pointerdown', 'mousedown'].forEach((name) => {
+    root.addEventListener(name, (e) => {
+      const t = e.composedPath()[0];
+      if (!isField(t)) return;
+      ownField = t;
+      reclaims = 0;
+      // after the event settles, whether or not the default survived
+      setTimeout(() => {
+        if (root.activeElement !== t && t.isConnected) {
+          t.focus({ preventScroll: true });
+          // a prevented default also skips caret placement, so put it somewhere
+          if (typeof t.setSelectionRange === 'function' && t.type !== 'color') {
+            try { t.setSelectionRange(t.value.length, t.value.length); } catch (_) {}
+          }
+        }
+      }, 0);
+    }, true);
+  });
+
+  // some libraries mark everything outside the dialog inert, which blocks
+  // focus at the browser level where no amount of event handling helps
+  const clearInert = () => {
+    if (host.hasAttribute('inert')) host.removeAttribute('inert');
+    let n = host.parentElement;
+    while (n) {
+      if (n.hasAttribute && n.hasAttribute('inert')) n.removeAttribute('inert');
+      n = n.parentElement;
+    }
+  };
+  clearInert();
+  new MutationObserver(clearInert).observe(document.documentElement, {
+    attributes: true, attributeFilter: ['inert'], subtree: false,
   });
 
   /* ---------- popovers ---------- */
@@ -1132,25 +1403,39 @@
       openPop = null;
     }
   }
-  // popovers rise above the toolbar: the dock is pinned to the bottom of the
-  // screen, so anything opening downward would fall off the edge
+  // Popovers are position:fixed and placed in viewport coordinates, so they
+  // escape the float panel's overflow clipping and can flip to whichever side
+  // of the toolbar actually has room. Docked, floating or popped out, the
+  // measurement is the same.
   function togglePop(id, trigger) {
     if (openPop === id) { closePop(); return; }
     closePop();
     const pop = $(id);
     pop.classList.add('open');
     trigger.classList.add('on');
-    const dockRect = $('dock').getBoundingClientRect();
-    const tRect = trigger.getBoundingClientRect();
-    const left = Math.min(tRect.left - dockRect.left, dockRect.width - pop.offsetWidth - 10);
-    pop.style.left = Math.max(8, left) + 'px';
-    if (mode === 'top' && !popup) {
-      pop.style.bottom = 'auto';
-      pop.style.top = (tRect.bottom - dockRect.top + 4) + 'px';
-    } else {
+
+    const win = popup || window;
+    const vw = win.innerWidth;
+    const vh = win.innerHeight;
+    const t = trigger.getBoundingClientRect();
+
+    pop.style.maxHeight = 'none';
+    const wanted = pop.offsetHeight;
+    const above = t.top - 8;
+    const below = vh - t.bottom - 8;
+    const openUp = above >= Math.min(wanted, below) || above > below;
+    const room = Math.max(120, openUp ? above : below);
+    pop.style.maxHeight = Math.min(wanted, room) + 'px';
+
+    if (openUp) {
       pop.style.top = 'auto';
-      pop.style.bottom = (dockRect.height - (tRect.top - dockRect.top) + 4) + 'px';
+      pop.style.bottom = (vh - t.top + 4) + 'px';
+    } else {
+      pop.style.bottom = 'auto';
+      pop.style.top = (t.bottom + 4) + 'px';
     }
+    pop.style.left = Math.max(8, Math.min(t.left, vw - pop.offsetWidth - 8)) + 'px';
+
     openPop = id;
     const first = pop.querySelector('input:not([type=checkbox]), select');
     if (first) first.focus({ preventScroll: true });
@@ -1425,6 +1710,7 @@
     segs = segs.filter((sg) => sg.keys.length);
     total = 0;
     segs.forEach((sg) => sg.keys.forEach((k) => { total = Math.max(total, k.t); }));
+    total = Math.max(total, audioEnd());
     if (total <= 0) total = 0.001;
 
     markers = [];
@@ -1466,7 +1752,7 @@
       try {
         const ctrl = animate(
           target,
-          { [prop]: pts.map((p) => coerce(p.val)) },
+          { [prop]: pts.map((p) => coerce(resolveDynamic(sel, prop, p.val))) },
           { duration: total, times, ease: pts.slice(1).map((p) => parseEase(p.ease)) }
         );
         ctrl.pause();
@@ -1488,6 +1774,8 @@
     anims.forEach((a) => { try { a.time = time; } catch (_) {} });
     $('playhead').style.left = GUTTER + time * pps + 'px';
     $('time').textContent = `${time.toFixed(2)} / ${total.toFixed(2)}s`;
+    // the take's live block grows with the playhead
+    if (recBar && micRec) recBar.style.width = Math.max((time - micRec.at) * pps, 4) + 'px';
     emitMove();
   }
 
@@ -1498,10 +1786,27 @@
     const dt = (now - last) / 1000;
     last = now;
     const from = time;
-    const t = Math.min(from + dt, total);
+    // with audio scheduled, its clock is the authority. rAF deltas drift,
+    // the audio context clock does not.
+    let t;
+    if (audioAnchor && actx) {
+      t = audioAnchor.timeStart + (actx.currentTime - audioAnchor.ctxStart);
+      if (t < from) t = from;   // before the scheduled start, hold
+    } else {
+      t = from + dt;
+    }
+
+    // a take is allowed to run past the end of what exists, so make room for
+    // it rather than stopping the playhead dead at the last keyframe
+    if (micRec && t > total - 0.5) {
+      total = Math.ceil(t + 5);
+      renderTracks();
+      renderRange();
+    }
+    t = Math.min(t, total);
     seek(t);
     markers.forEach((m) => { if (m.t > from && m.t <= t) fireMarker(m); });
-    if (t >= total) {
+    if (t >= total && !micRec) {
       stop();
       if (resetOnEnd) seek(0);
       return;
@@ -1510,9 +1815,15 @@
   }
 
   function play() {
-    if (total <= 0.01) return;
-    if (time >= total) seek(0);
+    // a take starts wherever the playhead is and runs past the end. rewinding
+    // to zero because the playhead sits at total is right for review and
+    // wrong for recording, and auto-advance parks it at total constantly.
+    if (!micRec) {
+      if (total <= 0.01) return;
+      if (time >= total) seek(0);
+    }
     focusedField = null;
+    scheduleAudio(time);
     playing = true;
     last = performance.now();
     $('play').textContent = 'pause';
@@ -1524,6 +1835,7 @@
     if (raf) cancelAnimationFrame(raf);
     raf = null;
     downButtons = 0;
+    stopAudio();
     $('play').textContent = 'play';
   }
 
@@ -1662,22 +1974,18 @@
     const dur = Math.max(0.2, parseFloat($('toDur').value) || 0.8);
     const at = time;
     const gid = nextGid++;
-    let tx = 500, ty = 400;
-    if (selectedEl && !selectedEl.startsWith('@')) {
-      const el = resolve(selectedEl);
-      if (el) {
-        const c = pageCenter(el);
-        tx = c.x;
-        ty = c.y;
-      }
-    }
+    // store a reference rather than a coordinate, so the move re-aims itself
+    // whenever the page reflows or the window is a different size at render
+    const live = selectedEl && !selectedEl.startsWith('@');
+    const tx = live ? `@(${selectedEl})` : 500;
+    const ty = live ? `@(${selectedEl})` : 400;
     addSegment('@cursor', 'x', [
       { t: at, val: readValue('@cursor', 'x'), ease: 'linear' },
-      { t: at + dur, val: round(tx - CURSOR_TIP.x), ease: 'easeInOut' },
+      { t: at + dur, val: tx, ease: 'easeInOut' },
     ], gid);
     addSegment('@cursor', 'y', [
       { t: at, val: readValue('@cursor', 'y'), ease: 'linear' },
-      { t: at + dur, val: round(ty - CURSOR_TIP.y), ease: 'easeInOut' },
+      { t: at + dur, val: ty, ease: 'easeInOut' },
     ], gid);
     if (!hasSeg('@cursor', 'opacity')) {
       addSegment('@cursor', 'opacity', [
@@ -1933,8 +2241,65 @@
       }
     }
 
+    if (audioClips.length || micRec) {
+      const arow = document.createElement('div');
+      arow.className = 'audiorow';
+      const acell = document.createElement('div');
+      acell.className = 'audiocell';
+      acell.textContent = micRec ? 'rec' : 'audio';
+      const alane = document.createElement('div');
+      alane.className = 'audiolane';
+      alane.style.width = w + 'px';
+
+      const cv = document.createElement('canvas');
+      alane.appendChild(cv);
+      arow.append(acell, alane);
+      rows.appendChild(arow);
+      drawWaves(cv, w);
+
+      audioClips.forEach((c) => {
+        const el = document.createElement('div');
+        el.className = 'aclip' + (selectedClip === c.id ? ' sel' : '');
+        el.style.left = c.offset * pps + 'px';
+        el.style.width = Math.max(clipLen(c) * pps, 6) + 'px';
+        el.title = `${c.name} · ${round(clipLen(c))}s`;
+        const nm = document.createElement('div');
+        nm.className = 'nm';
+        nm.textContent = c.name;
+        el.appendChild(nm);
+        el.addEventListener('mousedown', (ev) => {
+          if (ev.target !== el && ev.target !== nm) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          takeTimelineFocus();
+          selectedClip = c.id;
+          slideClip(ev, c, el, cv, w);
+        });
+        addClipHandles(el, c, cv, w);
+        alane.appendChild(el);
+      });
+
+      if (micRec) {
+        const live = document.createElement('div');
+        live.className = 'arec';
+        live.style.left = micRec.at * pps + 'px';
+        live.style.width = Math.max((time - micRec.at) * pps, 4) + 'px';
+        live.innerHTML = '<div class="dot"></div>';
+        alane.appendChild(live);
+        recBar = live;
+      } else recBar = null;
+    }
+
     if (!segs.length) {
-      rows.innerHTML = '<div class="empty-note">pick a target, then add an animation, an event or a preset</div>';
+      // append a node rather than touching innerHTML: reassigning it would
+      // re-parse the audio row above, handing back a blank canvas and
+      // throwing away every listener on the clips
+      const note = document.createElement('div');
+      note.className = 'empty-note';
+      note.textContent = audioClips.length
+        ? 'audio is loaded. pick a target, then add an animation, an event or a preset'
+        : 'pick a target, then add an animation, an event or a preset';
+      rows.appendChild(note);
       return;
     }
 
@@ -1991,6 +2356,8 @@
       takeTimelineFocus();
       dragBundle(ev, sorted.map((k) => ({ sg, k })));
     });
+    addEdgeHandles(band, 'sbh', () =>
+      [...sg.keys].sort((a, b) => a.t - b.t).map((k) => ({ sg, k })));
     lane.appendChild(band);
 
     const label = document.createElement('div');
@@ -2016,18 +2383,22 @@
       bar.style.width = Math.max(x.max - x.min, 0.05) * pps + 'px';
       bar.style.background = `hsl(${groupHue(gid)} 60% 55%)`;
       bar.title = 'drag to move the whole group';
+      // a group can span several segments, so gather it from all of them
+      const groupBundle = () => {
+        const out = [];
+        segs.forEach((s2) => s2.keys.forEach((k2) => {
+          if (k2.g === gid) out.push({ sg: s2, k: k2 });
+        }));
+        return out.sort((a, b) => a.k.t - b.k.t);
+      };
       bar.addEventListener('mousedown', (ev) => {
+        if (ev.target !== bar) return;
         ev.preventDefault();
         ev.stopPropagation();
         takeTimelineFocus();
-        // a group can span several segments, so gather it from all of them
-        const bundle = [];
-        segs.forEach((s2) => s2.keys.forEach((k2) => {
-          if (k2.g === gid) bundle.push({ sg: s2, k: k2 });
-        }));
-        bundle.sort((a, b) => a.k.t - b.k.t);
-        dragBundle(ev, bundle);
+        dragBundle(ev, groupBundle());
       });
+      addEdgeHandles(bar, 'gh', groupBundle);
       lane.appendChild(bar);
       dom.links.push({ el: bar, gid });
     });
@@ -2052,7 +2423,10 @@
       if (k.g) node.style.borderColor = `hsl(${groupHue(k.g)} 70% 70%)`;
       node.title = evt
         ? `${round(k.t)}s · ${(EVENTS[k.val] || {}).label || k.val}${k.ease ? ' “' + k.ease + '”' : ''}`
-        : `${round(k.t)}s → ${k.val}`;
+        : isDynamic(k.val)
+          ? `${round(k.t)}s → follows ${k.val.slice(2, -1)} (now ${resolveDynamic(sg.sel, sg.prop, k.val)})`
+          : `${round(k.t)}s → ${k.val}`;
+      if (!evt && isDynamic(k.val)) node.classList.add('dynamic');
       node.addEventListener('mousedown', (ev) => onKeyDown(ev, sg, k));
       lane.appendChild(node);
       keyNodes.push({ node, sg, k });
@@ -2293,9 +2667,105 @@
     window.addEventListener('blur', up, { once: true });
   }
 
+  /* Grab the side of a group or a segment to stretch or squeeze it. The far
+     edge stays put and everything inside scales toward or away from it, so the
+     shape of the gesture survives and only its speed changes. */
+  function beginEdgeScale(e, bundle, edge) {
+    if (!bundle.length) return;
+    const ts = bundle.map((p) => p.k.t);
+    const a0 = Math.min(...ts);
+    const b0 = Math.max(...ts);
+    if (b0 - a0 < 1e-6) return;          // a single instant has no side to pull
+
+    const anchor = edge === 'l' ? b0 : a0;
+    const starts = bundle.map((p) => ({ k: p.k, t0: p.k.t }));
+    const touched = [...new Set(bundle.map((p) => p.sg))];
+    const dragged = new Set(starts.map((s) => s.k));
+    const targets = snapTargets(dragged);
+    const guide = $('snapline');
+    const x0 = e.clientX;
+    const edge0 = edge === 'l' ? a0 : b0;
+
+    document.body.style.cursor = 'ew-resize';
+
+    const move = (ev) => {
+      if (ev.buttons === 0) { up(); return; }
+      let t = snapT(edge0 + (ev.clientX - x0) / pps, ev.altKey);
+
+      let hit = null;
+      if (!ev.altKey) {
+        const tol = 7 / pps;
+        targets.forEach((c) => {
+          const d = c - t;
+          if (Math.abs(d) <= tol && (!hit || Math.abs(d) < Math.abs(hit.d))) hit = { d, at: c };
+        });
+        if (hit) t = hit.at;
+      }
+
+      // keep at least one snap step of span, and never cross the anchor
+      t = edge === 'l'
+        ? Math.max(0, Math.min(t, anchor - SNAP))
+        : Math.max(t, anchor + SNAP);
+
+      const f = edge === 'l'
+        ? (anchor - t) / (anchor - a0)
+        : (t - anchor) / (b0 - anchor);
+      if (!isFinite(f) || f <= 0) return;
+
+      starts.forEach(({ k, t0 }) => { k.t = Math.max(0, anchor + (t0 - anchor) * f); });
+      touched.forEach(refreshSeg);
+
+      if (hit) {
+        guide.style.display = 'block';
+        guide.style.left = GUTTER + hit.at * pps + 'px';
+      } else guide.style.display = 'none';
+
+      const span = Math.abs(t - anchor);
+      $('time').textContent = `span ${round(span)}s  ×${round(f)}`;
+    };
+
+    let closed = false;
+    const up = () => {
+      if (closed) return;
+      closed = true;
+      window.removeEventListener('mousemove', move, true);
+      window.removeEventListener('mouseup', up, true);
+      window.removeEventListener('blur', up);
+      guide.style.display = 'none';
+      document.body.style.cursor = '';
+      starts.forEach(({ k }) => { k.t = round(k.t); });
+      build();
+      renderInspector();
+    };
+
+    window.addEventListener('mousemove', move, true);
+    window.addEventListener('mouseup', up, true);
+    window.addEventListener('blur', up, { once: true });
+  }
+
+  function addEdgeHandles(parent, cls, getBundle) {
+    ['l', 'r'].forEach((edge) => {
+      const h = document.createElement('div');
+      h.className = `${cls} ${edge}`;
+      h.title = 'drag to stretch or squeeze this, anchored at the far end';
+      h.addEventListener('mousedown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        takeTimelineFocus();
+        const bundle = getBundle();
+        selectBundle({ shiftKey: false, metaKey: false, ctrlKey: false }, bundle);
+        renderTracks();
+        renderInspector();
+        beginEdgeScale(ev, bundle, edge);
+      });
+      parent.appendChild(h);
+    });
+  }
+
   function startMarquee(e) {
     e.preventDefault();
     takeTimelineFocus();
+    selectedClip = null;
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     const base = additive ? new Set(selection) : new Set();
     const box = $('marquee');
@@ -2438,6 +2908,7 @@
         '<div class="hint">click a keyframe, a segment band, or a group bar to select it. ' +
         'shift-click any of them to add or remove. drag a lane to marquee. ' +
         'dragging anything selected moves the whole selection, spacing kept. ' +
+        'grab the left or right edge of a band or group bar to stretch or squeeze it. ' +
         'hold alt for free timing.</div>';
       return;
     }
@@ -2568,7 +3039,13 @@
           ${swatch}
           ${sg.prop === 'x' || sg.prop === 'y' ? `
           <div class="lbl">point</div>
-          <div class="wide"><button id="kPoint">pick a spot on the page ⌖</button></div>` : ''}`}
+          <div class="wide" style="display:flex;gap:5px">
+            <button id="kPoint">pick a spot ⌖</button>
+            ${isDynamic(k.val)
+              ? '<button id="kFreeze">freeze to a number</button>'
+              : '<button id="kFollow">follow an element ⌖</button>'}
+          </div>
+          ${isDynamic(k.val) ? `<div class="full hint">follows ${esc(k.val.slice(2, -1))}, currently ${resolveDynamic(sg.sel, sg.prop, k.val)}. it re-aims on every rebuild, resize and render.</div>` : ''}` : ''}`}
         </div>
       </div>
       <div class="actions">
@@ -2592,6 +3069,29 @@
       fireMarker({ t: k.t, type: k.val, detail: k.ease, sel: sg.sel }));
     const kc = box.querySelector('#kColor');
     if (kc) kc.addEventListener('input', () => { k.val = kc.value; build(); renderInspector(); });
+    const kfz = box.querySelector('#kFreeze');
+    if (kfz) kfz.addEventListener('click', () => {
+      k.val = String(resolveDynamic(sg.sel, sg.prop, k.val));
+      build();
+      renderInspector();
+    });
+    const kfl = box.querySelector('#kFollow');
+    if (kfl) kfl.addEventListener('click', () => {
+      pickPoint('follow which element', (pt) => {
+        const el = document.elementFromPoint(pt.x - window.scrollX, pt.y - window.scrollY);
+        if (!el) return;
+        const ref = `@(${cssPath(el)})`;
+        k.val = ref;
+        const other = sg.prop === 'x' ? 'y' : 'x';
+        segs.filter((s) => s.sel === sg.sel && s.prop === other).forEach((s) => {
+          const twin = s.keys.find((x) => Math.abs(x.t - k.t) < 0.001);
+          if (twin) twin.val = ref;
+        });
+        build();
+        renderInspector();
+      });
+    });
+
     const kp = box.querySelector('#kPoint');
     if (kp) kp.addEventListener('click', () => {
       pickPoint(`${shortSel(sg.sel)} ${sg.prop} to`, (pt) => {
@@ -2631,10 +3131,155 @@
 
   /* ---------- save and restore ---------- */
 
-  function serialize() {
-    return JSON.stringify({
-      version: 3, duration: round(total),
+  /* ---------- save and restore ----------
+     A sequence is segments, audio clips and the settings that change how it
+     reads back. Audio is the awkward part: the decoded buffers are far too
+     big to keep, so what gets stored is the original encoded bytes, once per
+     source no matter how many clips were sliced out of it. Exported files
+     embed those bytes as base64 and are self-contained. Browser slots put
+     them in IndexedDB instead, because one take would blow the localStorage
+     quota on its own.                                                       */
+
+  function toB64(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return btoa(s);
+  }
+
+  function fromB64(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+
+  function openDb() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('animlab', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('audio');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+
+  async function dbPut(key, value) {
+    const db = await openDb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('audio', 'readwrite');
+      tx.objectStore('audio').put(value, key);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+
+  async function dbDelete(key) {
+    const db = await openDb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('audio', 'readwrite');
+      tx.objectStore('audio').delete(key);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+
+  async function dbGet(key) {
+    const db = await openDb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('audio', 'readonly');
+      const q = tx.objectStore('audio').get(key);
+      q.onsuccess = () => res(q.result || null);
+      q.onerror = () => rej(q.error);
+    });
+  }
+
+  const usedSourceIds = () => [...new Set(audioClips.map((c) => c.sourceId).filter(Boolean))];
+
+  /* ---------- the container format ----------
+     "ANIMLAB" + a version byte + a CBOR payload. CBOR carries the encoded
+     audio as byte strings, where base64 in JSON would inflate it by a third
+     and cost a pass of string work in each direction. The header means a
+     file can be identified and version-checked before anything is parsed,
+     and old JSON saves still load because the first byte tells them apart. */
+
+  const MAGIC = 'ANIMLAB';
+  const FORMAT_VERSION = 5;
+
+  // JSON cannot hold bytes, so base64 them on the way out
+  function jsonSafe(snap) {
+    return {
+      ...snap,
+      audio: {
+        ...snap.audio,
+        sources: (snap.audio.sources || []).map((s) => ({
+          ...s,
+          data: s.data ? toB64(s.data.buffer ? s.data.buffer.slice(
+            s.data.byteOffset, s.data.byteOffset + s.data.byteLength) : s.data) : null,
+        })),
+      },
+    };
+  }
+
+  function packSequence(snap) {
+    if (!cborLib) {
+      return {
+        bytes: new TextEncoder().encode(JSON.stringify(jsonSafe(snap), null, 2)),
+        ext: 'json', mime: 'application/json', kind: 'json',
+      };
+    }
+    const body = cborLib.encode(snap);
+    const head = new TextEncoder().encode(MAGIC);
+    const out = new Uint8Array(head.length + 1 + body.length);
+    out.set(head, 0);
+    out[head.length] = FORMAT_VERSION;
+    out.set(body, head.length + 1);
+    return { bytes: out, ext: 'animlab', mime: 'application/octet-stream', kind: 'cbor' };
+  }
+
+  function unpackSequence(buf) {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    // a JSON save from before this format starts with a brace or whitespace
+    const first = bytes[0];
+    if (first === 0x7b || first === 0x20 || first === 0x0a || first === 0x09) {
+      return JSON.parse(new TextDecoder().decode(bytes));
+    }
+    const magic = new TextDecoder().decode(bytes.subarray(0, MAGIC.length));
+    if (magic !== MAGIC) throw new Error('not an animlab file');
+    const version = bytes[MAGIC.length];
+    if (version > FORMAT_VERSION) {
+      throw new Error(`saved by a newer version (${version}), this build reads up to ${FORMAT_VERSION}`);
+    }
+    if (!cborLib) throw new Error('cbor-x is needed to read this file and could not be loaded');
+    return cborLib.decode(bytes.subarray(MAGIC.length + 1));
+  }
+
+  function snapshot({ embedAudio }) {
+    const used = usedSourceIds();
+    return {
+      version: 4,
+      duration: round(total),
       range: range ? { a: range.a, b: range.b } : null,
+      view: { pps: round(pps), ripple, autoAdvance, liveMove, resetOnEnd, takeNo },
+      audio: {
+        volume: audioGain ? round(audioGain.gain.value * 100) : 100,
+        sources: used.map((id) => {
+          const s = audioSources.get(id);
+          return {
+            id, name: s.name, mime: s.mime,
+            size: s.bytes.byteLength,
+            // raw bytes. the packer decides whether they travel as CBOR byte
+            // strings or get base64'd into JSON
+            data: embedAudio ? new Uint8Array(s.bytes) : null,
+          };
+        }),
+        clips: audioClips.map((c) => ({
+          name: c.name, sourceId: c.sourceId,
+          offset: round(c.offset), inPoint: round(c.inPoint), outPoint: round(c.outPoint),
+        })),
+      },
       segments: segs.map((sg) => ({
         sel: sg.sel, prop: sg.prop, lane: sg.lane,
         keys: [...sg.keys].sort((a, b) => a.t - b.t).map((k) => {
@@ -2643,11 +3288,12 @@
           return o;
         }),
       })),
-    }, null, 2);
+    };
   }
 
-  function deserialize(json) {
+  async function restore(json) {
     const data = typeof json === 'string' ? JSON.parse(json) : json;
+
     const remap = new Map();
     const list = data.segments || data.tracks || [];
     segs = list.map((t) => ({
@@ -2662,8 +3308,66 @@
         return key;
       }),
     }));
+
     range = data.range && data.range.b > data.range.a ? { a: data.range.a, b: data.range.b } : null;
+
+    if (data.view) {
+      pps = data.view.pps || pps;
+      ripple = data.view.ripple !== false;
+      autoAdvance = data.view.autoAdvance !== false;
+      liveMove = data.view.liveMove !== false;
+      resetOnEnd = data.view.resetOnEnd !== false;
+      takeNo = data.view.takeNo || 0;
+      $('rRipple').checked = ripple;
+      $('autoAdv').checked = autoAdvance;
+      $('liveMove').checked = liveMove;
+      $('autoreset').checked = resetOnEnd;
+    }
+
+    stopAudio();
+    audioClips = [];
+    audioSources.clear();
+
+    const a = data.audio;
+    if (a && a.clips && a.clips.length) {
+      const ctx = ensureCtx();
+      if (a.volume != null) {
+        $('audVol').value = a.volume;
+        if (audioGain) audioGain.gain.value = a.volume / 100;
+      }
+
+      const decoded = new Map();
+      for (const s of a.sources || []) {
+        try {
+          // raw bytes from CBOR, base64 from a legacy JSON file, or parked
+          // in IndexedDB by a version 4 slot save
+          let bytes = null;
+          if (s.data instanceof Uint8Array) bytes = s.data.buffer.slice(
+            s.data.byteOffset, s.data.byteOffset + s.data.byteLength);
+          else if (s.data instanceof ArrayBuffer) bytes = s.data;
+          else if (typeof s.data === 'string') bytes = fromB64(s.data);
+          if (!bytes) {
+            const stored = await dbGet(s.id);
+            if (stored) bytes = stored.bytes;
+          }
+          if (!bytes) { console.warn('[animlab] audio source missing:', s.name); continue; }
+          audioSources.set(s.id, { name: s.name, mime: s.mime, bytes });
+          decoded.set(s.id, await ctx.decodeAudioData(bytes.slice(0)));
+        } catch (err) {
+          console.warn('[animlab] could not restore', s.name, err.message);
+        }
+      }
+
+      a.clips.forEach((c) => {
+        const buf = decoded.get(c.sourceId);
+        if (!buf) return;
+        addClip(c.name, buf, c.offset, c.sourceId, c.inPoint, c.outPoint);
+      });
+    }
+
+    refreshClipList();
     clearSelection();
+    selectedClip = null;
     time = 0;
     build();
     renderInspector();
@@ -2683,57 +3387,497 @@
   };
 
   $('seqList').addEventListener('change', (e) => { if (e.target.value) $('seqName').value = e.target.value; });
-  $('seqSave').addEventListener('click', () => {
+  // a slot is one packed blob in IndexedDB, audio and all. localStorage keeps
+  // only the list of names, which is what it is actually good for.
+  $('seqSave').addEventListener('click', async () => {
     const name = ($('seqName').value || '').trim();
     if (!name) { $('seqName').focus(); return; }
     try {
-      localStorage.setItem(LS_PREFIX + name, serialize());
+      const packed = packSequence(snapshot({ embedAudio: true }));
+      await dbPut('seq:' + name, {
+        bytes: packed.bytes, kind: packed.kind, saved: Date.now(),
+        duration: round(total), clips: audioClips.length, segments: segs.length,
+      });
       const names = savedNames();
       if (!names.includes(name)) { names.push(name); localStorage.setItem(LS_INDEX, JSON.stringify(names)); }
       refreshSeqList();
       $('seqList').value = name;
-      flash($('seqSave'), 'saved');
+      flash($('seqSave'), `${(packed.bytes.length / 1048576).toFixed(1)} MB`);
     } catch (err) { console.error('[animlab] save failed:', err); flash($('seqSave'), 'failed'); }
   });
-  $('seqLoad').addEventListener('click', () => {
-    const raw = localStorage.getItem(LS_PREFIX + ($('seqName').value || '').trim());
-    if (!raw) { flash($('seqLoad'), 'not found'); return; }
-    try { deserialize(raw); flash($('seqLoad'), 'loaded'); }
-    catch (err) { console.error('[animlab] load failed:', err); flash($('seqLoad'), 'bad json'); }
+
+  $('seqLoad').addEventListener('click', async () => {
+    const name = ($('seqName').value || '').trim();
+    try {
+      const rec = await dbGet('seq:' + name);
+      if (rec && rec.bytes) {
+        await restore(unpackSequence(rec.bytes));
+        flash($('seqLoad'), 'loaded');
+        return;
+      }
+      // anything saved before the binary format lives in localStorage
+      const raw = localStorage.getItem(LS_PREFIX + name);
+      if (!raw) { flash($('seqLoad'), 'not found'); return; }
+      await restore(raw);
+      flash($('seqLoad'), 'loaded');
+    } catch (err) {
+      console.error('[animlab] load failed:', err);
+      flash($('seqLoad'), 'unreadable');
+    }
   });
-  $('seqDel').addEventListener('click', () => {
+  $('seqDel').addEventListener('click', async () => {
     const name = ($('seqName').value || '').trim();
     if (!name) return;
     localStorage.removeItem(LS_PREFIX + name);
+    try { await dbDelete('seq:' + name); } catch (_) {}
     localStorage.setItem(LS_INDEX, JSON.stringify(savedNames().filter((n) => n !== name)));
     refreshSeqList();
     flash($('seqDel'), 'deleted');
   });
   $('seqExport').addEventListener('click', () => {
     const name = ($('seqName').value || 'animlab').trim();
+    const snap = snapshot({ embedAudio: $('seqEmbed').checked });
+    let out;
+    if ($('seqJson').checked) {
+      const text = JSON.stringify(jsonSafe(snap), null, 2);
+      out = { bytes: new TextEncoder().encode(text), ext: 'animlab.json', mime: 'application/json' };
+    } else {
+      const p = packSequence(snap);
+      out = { bytes: p.bytes, ext: p.ext === 'json' ? 'animlab.json' : 'animlab', mime: p.mime };
+    }
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([serialize()], { type: 'application/json' }));
-    a.download = name + '.animlab.json';
+    a.href = URL.createObjectURL(new Blob([out.bytes], { type: out.mime }));
+    a.download = `${name}.${out.ext}`;
     a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    console.log(`[animlab] exported ${(out.bytes.length / 1048576).toFixed(2)} MB as ${out.ext}`);
   });
   $('seqImport').addEventListener('click', () => $('fileIn').click());
   $('fileIn').addEventListener('change', async (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
     try {
-      deserialize(await f.text());
-      $('seqName').value = f.name.replace(/\.animlab\.json$|\.json$/, '');
+      await restore(unpackSequence(await f.arrayBuffer()));
+      $('seqName').value = f.name.replace(/\.animlab(\.json)?$|\.json$/, '');
       flash($('seqImport'), 'imported');
     } catch (err) { console.error('[animlab] import failed:', err); flash($('seqImport'), 'bad file'); }
     e.target.value = '';
   });
   $('seqClear').addEventListener('click', () => {
-    stop(); restoreAll();
-    segs = []; range = null; time = 0;
+    stop(); restoreAll(); clearAudio();
+    segs = []; range = null; time = 0; takeNo = 0;
     clearSelection(); build(); renderInspector();
   });
   refreshSeqList();
+
+  /* ---------- audio ----------
+     A reference track. The waveform is drawn from precomputed peaks so it
+     redraws instantly at any zoom, playback is driven off the audio element's
+     own clock so it cannot drift from the animation, and the same element is
+     tapped into the recorder so the render comes out with sound already in it. */
+
+  // Peak level per clip. A voice take sits far below full scale, so drawing
+  // it against an absolute ceiling gives a flat line that reads as "empty".
+  // Every clip is scaled against its own loudest moment instead.
+  const peakCeiling = (peaks) => {
+    let m = 0;
+    for (let i = 0; i < peaks.length; i++) if (peaks[i] > m) m = peaks[i];
+    return Math.max(m, 0.02);
+  };
+
+  function computePeaks(buffer) {
+    const ch = buffer.getChannelData(0);
+    const n = Math.max(1, Math.ceil(buffer.duration * PEAKS_PER_SEC));
+    const per = Math.max(1, Math.floor(ch.length / n));
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let m = 0;
+      const s = i * per;
+      const e = Math.min(s + per, ch.length);
+      for (let j = s; j < e; j++) {
+        const v = ch[j] < 0 ? -ch[j] : ch[j];
+        if (v > m) m = v;
+      }
+      out[i] = m;
+    }
+    return out;
+  }
+
+  function ensureCtx() {
+    if (!actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      audioGain = actx.createGain();
+      audioGain.gain.value = (parseFloat($('audVol').value) || 100) / 100;
+      audioGain.connect(actx.destination);
+    }
+    if (actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+
+  function registerSource(name, mime, bytes) {
+    const id = 'src' + (nextId++);
+    audioSources.set(id, { name, mime, bytes });
+    return id;
+  }
+
+  const clipLen = (c) => c.outPoint - c.inPoint;
+  const clipEnd = (c) => c.offset + clipLen(c);
+  const audioEnd = () => audioClips.reduce((m, c) => Math.max(m, clipEnd(c)), 0);
+
+  function addClip(name, buffer, offset, sourceId, inPoint, outPoint) {
+    const c = {
+      id: nextId++, name, buffer, sourceId,
+      peaks: computePeaks(buffer),
+      offset: Math.max(0, round(offset)),
+      inPoint: inPoint == null ? 0 : inPoint,
+      outPoint: outPoint == null ? buffer.duration : outPoint,
+    };
+    c.ceiling = peakCeiling(c.peaks);
+    audioClips.push(c);
+    refreshClipList();
+    build();
+    return c;
+  }
+
+  async function loadAudioFile(file) {
+    try {
+      const bytes = await file.arrayBuffer();
+      // decodeAudioData detaches what it is given, so hand it a copy and keep
+      // the original encoded bytes for saving
+      const decoded = await ensureCtx().decodeAudioData(bytes.slice(0));
+      const name = file.name.replace(/\.[^.]+$/, '');
+      addClip(name, decoded, time, registerSource(name, file.type || 'audio/*', bytes));
+    } catch (err) {
+      console.error('[animlab] could not decode that audio:', err);
+      $('audInfo').textContent = 'could not decode that file';
+    }
+  }
+
+  function refreshClipList() {
+    const n = audioClips.length;
+    $('audInfo').textContent = n
+      ? `${n} clip${n > 1 ? 's' : ''} · ${round(audioEnd())}s of timeline covered`
+      : 'no audio yet';
+    $('audClear').hidden = !n;
+  }
+
+  /* ---------- audio playback ----------
+     Clips are scheduled on the WebAudio clock rather than played through an
+     element, which is what makes trims, gaps and overlaps work at all. That
+     clock also drives the playhead, so picture cannot drift from sound.      */
+
+  function stopAudio() {
+    liveSources.forEach((s) => { try { s.stop(); } catch (_) {} });
+    liveSources = [];
+    audioAnchor = null;
+  }
+
+  function scheduleAudio(fromTime) {
+    stopAudio();
+    if (!audioClips.length) return;
+    const ctx = ensureCtx();
+    const t0 = ctx.currentTime + 0.06;
+    audioAnchor = { ctxStart: t0, timeStart: fromTime };
+
+    audioClips.forEach((c) => {
+      const end = clipEnd(c);
+      if (end <= fromTime) return;
+      const startAt = Math.max(c.offset, fromTime);
+      const dur = end - startAt;
+      if (dur <= 0.001) return;
+      const node = ctx.createBufferSource();
+      node.buffer = c.buffer;
+      node.connect(audioGain);
+      if (audioDest) node.connect(audioDest);
+      node.start(t0 + (startAt - fromTime), c.inPoint + (startAt - c.offset), dur);
+      liveSources.push(node);
+    });
+  }
+
+  /* ---------- destructive-looking edits, done non-destructively ----------
+     Cutting a span just re-points clip in and out markers around it. The
+     underlying buffers are never touched, so a cut costs nothing and two
+     halves of a split clip still share one decode.                          */
+
+  function cutAudioRange(a, b, ripple, alsoKeys) {
+    if (b - a < 1e-4) return;
+    const len = b - a;
+    const next = [];
+    audioClips.forEach((c) => {
+      const s = c.offset;
+      const e = clipEnd(c);
+      if (e <= a + 1e-6 || s >= b - 1e-6) { next.push(c); return; }
+      if (s < a) {
+        next.push({ ...c, id: nextId++, outPoint: c.inPoint + (a - s) });
+      }
+      if (e > b) {
+        next.push({ ...c, id: nextId++, offset: round(b), inPoint: c.inPoint + (b - s) });
+      }
+    });
+    audioClips = next.filter((c) => clipLen(c) > 0.01);
+
+    if (ripple) {
+      audioClips.forEach((c) => {
+        if (c.offset >= b - 1e-6) c.offset = round(Math.max(0, c.offset - len));
+      });
+      if (alsoKeys) {
+        segs.forEach((sg) => sg.keys.forEach((k) => {
+          if (k.t >= b - 1e-6) k.t = round(Math.max(0, k.t - len));
+        }));
+      }
+    }
+    refreshClipList();
+    build();
+    renderInspector();
+  }
+
+  // Slice at a time, keeping both halves. Like every other audio edit this is
+  // just marker arithmetic: the two pieces go on sharing one decoded buffer
+  // and one set of peaks, so slicing a long take costs nothing.
+  function splitAudioAt(t, quiet) {
+    const next = [];
+    let cuts = 0;
+    audioClips.forEach((c) => {
+      const s = c.offset;
+      const e = clipEnd(c);
+      if (t <= s + 0.02 || t >= e - 0.02) { next.push(c); return; }
+      cuts += 1;
+      const at = c.inPoint + (t - s);
+      next.push({ ...c, id: nextId++, outPoint: at });
+      next.push({ ...c, id: nextId++, offset: round(t), inPoint: at });
+    });
+    if (!cuts) {
+      if (!quiet) flash($('audSlice'), 'nothing under it');
+      return 0;
+    }
+    audioClips = next;
+    selectedClip = null;
+    refreshClipList();
+    build();
+    return cuts;
+  }
+
+  function deleteClip(id) {
+    const before = audioClips.length;
+    audioClips = audioClips.filter((c) => c.id !== id);
+    if (audioClips.length === before) return false;
+    selectedClip = null;
+    refreshClipList();
+    build();
+    return true;
+  }
+
+  function insertAudioGap(at, len, alsoKeys) {
+    audioClips.forEach((c) => {
+      if (c.offset >= at - 1e-6) c.offset = round(c.offset + len);
+    });
+    if (alsoKeys) {
+      segs.forEach((sg) => sg.keys.forEach((k) => {
+        if (k.t >= at - 1e-6) k.t = round(k.t + len);
+      }));
+    }
+    build();
+  }
+
+  /* ---------- recording ---------- */
+
+  async function startTake() {
+    if (micRec) return;
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      console.warn('[animlab] microphone unavailable:', err.message);
+      $('audInfo').textContent = 'no microphone access';
+      return;
+    }
+    const rec = new MediaRecorder(stream);
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    micRec = { rec, stream, chunks, at: time, startedWall: performance.now() };
+    $('audRec').textContent = 'stop the take';
+    $('audRec').classList.add('on');
+    rec.start();
+    if ($('audPlayWhileRec').checked) play();
+    renderTracks();
+  }
+
+  async function stopTake() {
+    if (!micRec) return;
+    const { rec, stream, chunks, at } = micRec;
+    const blob = await new Promise((res) => {
+      rec.onstop = () => res(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }));
+      if (rec.state !== 'inactive') rec.stop();
+      else res(new Blob(chunks, { type: 'audio/webm' }));
+    });
+    stream.getTracks().forEach((t) => t.stop());
+    const endedAt = time;
+    micRec = null;
+    $('audRec').textContent = 'record from the playhead';
+    $('audRec').classList.remove('on');
+    stop();
+    time = endedAt;   // stay where the take finished, ready for the next one
+
+    if (!blob.size) { renderTracks(); return; }
+    try {
+      takeNo += 1;
+      const bytes = await blob.arrayBuffer();
+      const decoded = await ensureCtx().decodeAudioData(bytes.slice(0));
+      const name = `take ${takeNo}`;
+      addClip(name, decoded, at, registerSource(name, blob.type || 'audio/webm', bytes));
+      seek(endedAt);
+    } catch (err) {
+      console.error('[animlab] could not decode the take:', err);
+    }
+  }
+
+  function clearAudio() {
+    stopAudio();
+    audioClips = [];
+    audioSources.clear();
+    refreshClipList();
+    build();
+  }
+
+  function drawWaves(canvas, w) {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.round(AUDIO_H * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = AUDIO_H + 'px';
+    const g = canvas.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, AUDIO_H);
+
+    const mid = AUDIO_H / 2;
+    const step = Math.max(1, Math.floor(PEAKS_PER_SEC / pps));
+
+    audioClips.forEach((c) => {
+      const x0 = c.offset * pps;
+      const x1 = clipEnd(c) * pps;
+      g.fillStyle = '#3f7f96';
+      const ceil = c.ceiling || peakCeiling(c.peaks);
+      for (let px = Math.max(0, Math.floor(x0)); px < Math.min(w, x1); px++) {
+        // map the pixel back into the source buffer, honouring the trim
+        const tIn = c.inPoint + (px - x0) / pps;
+        const idx = Math.floor(tIn * PEAKS_PER_SEC);
+        let a = 0;
+        for (let k = idx; k < idx + step && k < c.peaks.length; k++) {
+          if (c.peaks[k] > a) a = c.peaks[k];
+        }
+        const h = Math.min(a / ceil, 1) * (mid - 4);
+        g.fillRect(px, mid - h, 1, Math.max(h * 2, 1));
+      }
+      g.strokeStyle = 'rgba(63,127,150,.35)';
+      g.beginPath();
+      g.moveTo(Math.max(0, x0), mid);
+      g.lineTo(Math.min(w, x1), mid);
+      g.stroke();
+    });
+  }
+
+  /* ---------- moving and trimming clips ---------- */
+
+  function slideClip(e, c, el, cv, w) {
+    const x0 = e.clientX;
+    const o0 = c.offset;
+    const others = audioClips.filter((x) => x !== c);
+    const targets = [
+      0, time,
+      ...(range ? [range.a, range.b] : []),
+      ...others.flatMap((x) => [x.offset, clipEnd(x)]),
+      ...segs.flatMap((sg) => sg.keys.map((k) => k.t)),
+    ];
+    const guide = $('snapline');
+    document.body.style.cursor = 'grabbing';
+
+    const move = (ev) => {
+      if (ev.buttons === 0) { up(); return; }
+      let t = snapT(Math.max(0, o0 + (ev.clientX - x0) / pps), ev.altKey);
+      let hit = null;
+      if (!ev.altKey) {
+        const tol = 7 / pps;
+        [t, t + clipLen(c)].forEach((edge) => targets.forEach((cand) => {
+          const d = cand - edge;
+          if (Math.abs(d) <= tol && (!hit || Math.abs(d) < Math.abs(hit.d))) hit = { d, at: cand };
+        }));
+        if (hit && t + hit.d >= 0) t += hit.d;
+      }
+      c.offset = t;
+      el.style.left = c.offset * pps + 'px';
+      drawWaves(cv, w);
+      guide.style.display = hit ? 'block' : 'none';
+      if (hit) guide.style.left = GUTTER + hit.at * pps + 'px';
+      $('time').textContent = `clip at ${round(c.offset)}s`;
+    };
+    let closed = false;
+    const up = () => {
+      if (closed) return;
+      closed = true;
+      window.removeEventListener('mousemove', move, true);
+      window.removeEventListener('mouseup', up, true);
+      window.removeEventListener('blur', up);
+      guide.style.display = 'none';
+      document.body.style.cursor = '';
+      c.offset = round(c.offset);
+      build();
+    };
+    window.addEventListener('mousemove', move, true);
+    window.addEventListener('mouseup', up, true);
+    window.addEventListener('blur', up, { once: true });
+  }
+
+  // trimming moves the in or out marker. the buffer is never touched, so a
+  // trim is reversible and costs nothing
+  function addClipHandles(parent, c, cv, w) {
+    ['l', 'r'].forEach((edge) => {
+      const h = document.createElement('div');
+      h.className = `sbh ${edge}`;
+      h.title = edge === 'l' ? 'trim the start' : 'trim the end';
+      h.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        takeTimelineFocus();
+        selectedClip = c.id;
+        const x0 = e.clientX;
+        const inP = c.inPoint;
+        const outP = c.outPoint;
+        const off = c.offset;
+
+        const move = (ev) => {
+          if (ev.buttons === 0) { up(); return; }
+          const d = (ev.clientX - x0) / pps;
+          if (edge === 'l') {
+            const delta = Math.max(-inP, Math.min(d, outP - inP - 0.05));
+            c.inPoint = inP + delta;
+            c.offset = Math.max(0, off + delta);
+          } else {
+            c.outPoint = Math.max(c.inPoint + 0.05, Math.min(outP + d, c.buffer.duration));
+          }
+          parent.style.left = c.offset * pps + 'px';
+          parent.style.width = Math.max(clipLen(c) * pps, 6) + 'px';
+          drawWaves(cv, w);
+          $('time').textContent = `clip ${round(clipLen(c))}s`;
+        };
+        let closed = false;
+        const up = () => {
+          if (closed) return;
+          closed = true;
+          window.removeEventListener('mousemove', move, true);
+          window.removeEventListener('mouseup', up, true);
+          window.removeEventListener('blur', up);
+          c.offset = round(c.offset);
+          build();
+        };
+        window.addEventListener('mousemove', move, true);
+        window.addEventListener('mouseup', up, true);
+        window.addEventListener('blur', up, { once: true });
+      });
+      parent.appendChild(h);
+    });
+  }
 
   /* ---------- render to video ----------
      There is no way to rasterise an arbitrary live page deterministically from
@@ -2802,6 +3946,18 @@
       return;
     }
 
+    // tap the mix into the recorded stream so the file lands with sound in it
+    if (audioClips.length) {
+      try {
+        const ctx = ensureCtx();
+        if (!audioDest) audioDest = ctx.createMediaStreamDestination();
+        const track = audioDest.stream.getAudioTracks()[0];
+        if (track) src.stream.addTrack(track);
+      } catch (err) {
+        console.warn('[animlab] recording without audio:', err.message);
+      }
+    }
+
     const chunks = [];
     let rec;
     try {
@@ -2818,7 +3974,9 @@
     rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
 
     const wasHidden = hidden;
-    const hideForTake = src.kind === 'screen' && !popup;
+    // a screen or whole-desktop share sees the panel wherever it lives, popped
+    // out included, so hide it for every screen take
+    const hideForTake = src.kind === 'screen' && $('rvHidePanel').checked;
     let aborted = false;
 
     const onEsc = (e) => {
@@ -2830,17 +3988,28 @@
     $('rvStop').hidden = false;
     $('rvGo').disabled = true;
     document.addEventListener('keydown', onEsc, true);
-    if (hideForTake) setHidden(true);
+    if (hideForTake) {
+      setHidden(true);
+      if (popup && !popup.closed) popup.blur();
+      window.focus();
+    }
 
-    // let the browser settle after the share prompt, then start from the top
+    // resolve any element-relative targets against the layout as it is now
+    build();
+
+    // let the compositor settle after the share prompt and the panel hiding,
+    // otherwise the first frames still contain it
     stop();
     seek(0);
-    await wait(250);
+    await wait(450);
 
     const fired = new Set();
+    stopAudio();
     rec.start();
     await wait(lead * 1000);
 
+    // one schedule for the whole take, from the top
+    scheduleAudio(0);
     const started = performance.now();
     await new Promise((done) => {
       const step = (now) => {
@@ -2864,6 +4033,7 @@
       else res(new Blob(chunks, { type: mime || 'video/webm' }));
     });
 
+    stopAudio();
     src.stream.getTracks().forEach((t) => t.stop());
     document.removeEventListener('keydown', onEsc, true);
     rendering = null;
@@ -2904,6 +4074,52 @@
   }
   $('rvSource').addEventListener('change', describeSource);
   describeSource();
+
+  $('audPick').addEventListener('click', () => $('audIn').click());
+  $('audIn').addEventListener('change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) await loadAudioFile(f);
+    e.target.value = '';
+  });
+  $('audRec').addEventListener('click', () => (micRec ? stopTake() : startTake()));
+  $('audClear').addEventListener('click', clearAudio);
+  $('audVol').addEventListener('change', () => {
+    const v = Math.max(0, Math.min(2, (parseFloat($('audVol').value) || 100) / 100));
+    if (audioGain) audioGain.gain.value = v;
+  });
+  $('audSlice').addEventListener('click', () => { splitAudioAt(time); });
+  $('audSliceRange').addEventListener('click', () => {
+    if (!range) { flash($('audSliceRange'), 'set a range'); return; }
+    // slice the later edge first, or splitting the earlier one renumbers
+    // the clip the second cut is aiming at
+    const n = splitAudioAt(range.b, true) + splitAudioAt(range.a, true);
+    if (!n) flash($('audSliceRange'), 'nothing under it');
+  });
+  $('audDelClip').addEventListener('click', () => {
+    if (!selectedClip || !deleteClip(selectedClip)) flash($('audDelClip'), 'select a clip');
+  });
+
+  $('audCut').addEventListener('click', () => {
+    if (!range) { flash($('audCut'), 'set a range'); return; }
+    cutAudioRange(range.a, range.b, true, $('audRipKeys').checked);
+  });
+  $('audLift').addEventListener('click', () => {
+    if (!range) { flash($('audLift'), 'set a range'); return; }
+    cutAudioRange(range.a, range.b, false, false);
+  });
+  $('audGap').addEventListener('click', () => {
+    if (!range) { flash($('audGap'), 'set a range'); return; }
+    insertAudioGap(range.a, range.b - range.a, $('audRipKeys').checked);
+  });
+
+  // dropping a clip anywhere on the timeline loads it at the playhead
+  ['dragover', 'drop'].forEach((n) => $('tl').addEventListener(n, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (n !== 'drop') return;
+    const f = [...(e.dataTransfer.files || [])].find((x) => x.type.startsWith('audio/'));
+    if (f) loadAudioFile(f);
+  }));
 
   $('rvGo').addEventListener('click', renderVideo);
   $('rvStop').addEventListener('click', () => {
@@ -2990,10 +4206,13 @@
       if (!ts.length) return;
       e.preventDefault();
       setRange(Math.min(...ts), Math.max(...ts));
-    } else if (e.key === 'Delete' || e.key === 'Backspace') {
-      if (!selection.size) return;
+    } else if (e.key === 's' || e.key === 'S') {
+      if (!audioClips.length) return;
       e.preventDefault();
-      deleteSelected();
+      splitAudioAt(time);
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selection.size) { e.preventDefault(); deleteSelected(); return; }
+      if (selectedClip) { e.preventDefault(); deleteClip(selectedClip); }
     }
   }
 
@@ -3116,6 +4335,11 @@
     seek(time);
   }
 
+  $('guardChk').addEventListener('change', (e) => {
+    guardFocus = e.target.checked;
+    if (!guardFocus) ownField = null;
+  });
+
   $('dockPopOut').addEventListener('click', () => { closePop(); popOut(); });
   $('dockPopIn').addEventListener('click', () => { closePop(); popIn(); });
 
@@ -3184,7 +4408,15 @@
     window.addEventListener('mouseup', up, true);
   });
 
-  window.addEventListener('resize', () => { if (!popup) applyMode(); });
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    if (!popup) applyMode();
+    // element references resolve against layout, so refresh them once it settles
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (segs.some((sg) => sg.keys.some((k) => isDynamic(k.val)))) build();
+    }, 200);
+  });
 
   applyMode();
   renderTracks();
@@ -3203,14 +4435,87 @@
     fire: fireMarker,
     seek, play, pause: stop, setRange, typeOut,
     render: renderVideo,
+    get audioClips() {
+      return audioClips.map((c) => ({
+        name: c.name, offset: c.offset, length: round(clipLen(c)),
+        inPoint: round(c.inPoint), outPoint: round(c.outPoint),
+      }));
+    },
+
+    // run __animLab.diagnoseFocus() and paste the table if fields still fight back
+    async diagnoseFocus() {
+      // open the popover first: a field inside a display:none subtree can
+      // never take focus, and testing one tells you nothing
+      const wasOpen = openPop;
+      if (openPop !== 'popAnimate') {
+        togglePop('popAnimate', root.querySelector('[data-pop="popAnimate"]'));
+      }
+      await new Promise((r2) => setTimeout(r2, 30));
+
+      const f = root.getElementById('toVal');
+      const r = {};
+      r.fieldVisible = !!(f.offsetWidth || f.offsetHeight);
+      r.dockPointerEvents = getComputedStyle(root.getElementById('dock')).pointerEvents;
+      r.panelEngaged = panelEngaged;
+      r.guardFocus = guardFocus;
+      r.inertOnHost = host.hasAttribute('inert');
+      r.inertOnHtml = document.documentElement.hasAttribute('inert');
+      r.hostPointerEvents = getComputedStyle(host).pointerEvents;
+      r.bodyPointerEvents = getComputedStyle(document.body).pointerEvents;
+      r.hostInDocument = host.isConnected;
+      r.poppedOut = !!popup;
+
+      const md = new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true });
+      f.dispatchEvent(md);
+      r.mousedownDefaultPrevented = md.defaultPrevented;
+
+      const pd = new PointerEvent('pointerdown', { bubbles: true, cancelable: true, composed: true });
+      f.dispatchEvent(pd);
+      r.pointerdownDefaultPrevented = pd.defaultPrevented;
+
+      f.focus();
+      r.focusTookImmediately = root.activeElement === f;
+      r.documentActiveIsHost = document.activeElement === host;
+
+      // does typing actually reach it?
+      f.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true, composed: true }));
+      r.canType = root.activeElement === f;
+
+      return new Promise((res) => setTimeout(() => {
+        r.stillFocusedAfter150ms = root.activeElement === f;
+        r.stolenBy = r.stillFocusedAfter150ms ? null :
+          ((document.activeElement && document.activeElement.tagName) || 'unknown') +
+          (document.activeElement && document.activeElement.className
+            ? '.' + String(document.activeElement.className).split(' ')[0] : '');
+        console.table(r);
+        if (!wasOpen) closePop();
+        res(r);
+      }, 150));
+    },
+    loadAudioFile, cutAudioRange, insertAudioGap, splitAudioAt, deleteClip,
+    startTake, stopTake, clearAudio,
     fitRange(a, b, length) { setRange(a, b); scaleRange(a, a + length); },
-    save: serialize,
-    load: deserialize,
+    // save() gives packed bytes ready to write; saveObject() the raw snapshot
+    save(opts) {
+      return packSequence(snapshot({ embedAudio: (opts && opts.embedAudio) !== false }));
+    },
+    saveObject: (opts) => snapshot({ embedAudio: (opts && opts.embedAudio) !== false }),
+    load(input) {
+      const data = (input instanceof ArrayBuffer || input instanceof Uint8Array)
+        ? unpackSequence(input)
+        : input;
+      return restore(data);
+    },
+    formatVersion: FORMAT_VERSION,
     get mode() { return popup ? 'popped-out' : mode; },
     dock(next) { mode = next === 'top' || next === 'float' ? next : 'bottom'; applyMode(); },
     popOut, popIn,
     destroy() {
       stopPick(); stop(); restoreAll();
+      restoreFocusPatch();
+      if (micRec) { try { micRec.rec.stop(); } catch (_) {} micRec.stream.getTracks().forEach((t) => t.stop()); }
+      stopAudio();
+      if (actx) { try { actx.close(); } catch (_) {} }
       if (rendering) {
         try { rendering.rec.stop(); } catch (_) {}
         rendering.src.stream.getTracks().forEach((t) => t.stop());
