@@ -1043,12 +1043,6 @@
       <div class="pop" id="popRender">
         <h4>record the sequence and download it</h4>
         <div class="pg">
-          <div class="lbl">capture</div>
-          <select class="wide" id="rvSource">
-            <option value="auto">auto: canvas if the target is one, else screen</option>
-            <option value="canvas">the selected canvas only</option>
-            <option value="screen">screen, window or tab</option>
-          </select>
           <div class="lbl">format</div>
           <select class="wide" id="rvFormat"></select>
           <div class="lbl">fps</div>
@@ -1069,8 +1063,8 @@
           <button id="rvStop" hidden>stop</button>
         </div>
         <div class="hint" id="rvHint">
-          recording runs in real time. screen capture asks which surface to share,
-          and the panel hides itself for the take. esc aborts.
+          runs in real time. you pick the surface to share, and the panel takes
+          itself off screen for the take, popped-out window included. esc aborts.
         </div>
       </div>
 
@@ -1539,7 +1533,6 @@
     $('typeInfo').textContent = f
       ? `target: <${f.tagName.toLowerCase()}> found, typing will land here`
       : 'target: no text field found under this element';
-    if (root.getElementById('rvHint')) describeSource();
   }
 
   function startPick() {
@@ -3903,27 +3896,14 @@
     if (!ok.length) $('rvGo').disabled = true;
   })();
 
-  function canvasFor(sel) {
-    const el = resolve(sel);
-    if (!el) return null;
-    if (el.tagName === 'CANVAS') return el;
-    return el.querySelector ? el.querySelector('canvas') : null;
-  }
-
-  async function getStream(kind, fps) {
-    if (kind !== 'screen') {
-      const c = canvasFor(selectedEl || 'body') || document.querySelector('canvas');
-      if (c && c.captureStream) return { stream: c.captureStream(fps), kind: 'canvas', el: c };
-      if (kind === 'canvas') throw new Error('no canvas found under the selected target');
-    }
-    const stream = await navigator.mediaDevices.getDisplayMedia({
+  async function getStream(fps) {
+    return navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: fps },
       audio: false,
       preferCurrentTab: true,
       selfBrowserSurface: 'include',
       surfaceSwitching: 'exclude',
     });
-    return { stream, kind: 'screen' };
   }
 
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -3937,9 +3917,9 @@
     const lead = Math.max(0, parseFloat($('rvLead').value) || 0);
     const tail = Math.max(0, parseFloat($('rvTail').value) || 0);
 
-    let src;
+    let stream;
     try {
-      src = await getStream($('rvSource').value, fps);
+      stream = await getStream(fps);
     } catch (err) {
       console.warn('[animlab] capture cancelled or unavailable:', err.message);
       flash($('rvGo'), 'no source');
@@ -3952,7 +3932,7 @@
         const ctx = ensureCtx();
         if (!audioDest) audioDest = ctx.createMediaStreamDestination();
         const track = audioDest.stream.getAudioTracks()[0];
-        if (track) src.stream.addTrack(track);
+        if (track) stream.addTrack(track);
       } catch (err) {
         console.warn('[animlab] recording without audio:', err.message);
       }
@@ -3961,46 +3941,49 @@
     const chunks = [];
     let rec;
     try {
-      rec = new MediaRecorder(src.stream, {
+      rec = new MediaRecorder(stream, {
         mimeType: mime || undefined,
         videoBitsPerSecond: 12_000_000,
       });
     } catch (err) {
       console.error('[animlab] recorder refused those settings:', err);
-      src.stream.getTracks().forEach((t) => t.stop());
+      stream.getTracks().forEach((t) => t.stop());
       flash($('rvGo'), 'bad format');
       return;
     }
     rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
 
     const wasHidden = hidden;
-    // a screen or whole-desktop share sees the panel wherever it lives, popped
-    // out included, so hide it for every screen take
-    const hideForTake = src.kind === 'screen' && $('rvHidePanel').checked;
+    const hideForTake = $('rvHidePanel').checked;
     let aborted = false;
 
     const onEsc = (e) => {
       if (e.key === 'Escape') { aborted = true; e.preventDefault(); e.stopPropagation(); }
     };
 
-    rendering = { rec, src };
+    rendering = { rec, stream };
     closePop();
     $('rvStop').hidden = false;
     $('rvGo').disabled = true;
     document.addEventListener('keydown', onEsc, true);
+    // A popped-out panel is a separate OS window. Hiding its contents leaves
+    // an empty window sitting on the desktop, which a screen or window share
+    // still records, so bring it home for the take and send it back after.
+    const wasPopped = !!popup;
     if (hideForTake) {
+      if (wasPopped) popIn();
       setHidden(true);
-      if (popup && !popup.closed) popup.blur();
       window.focus();
     }
 
     // resolve any element-relative targets against the layout as it is now
     build();
 
-    // let the compositor settle after the share prompt and the panel hiding,
-    // otherwise the first frames still contain it
     stop();
     seek(0);
+    // two frames for the hide to reach the compositor, then a settle for the
+    // capture pipeline, or the opening frames still contain the panel
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await wait(450);
 
     const fired = new Set();
@@ -4034,12 +4017,13 @@
     });
 
     stopAudio();
-    src.stream.getTracks().forEach((t) => t.stop());
+    stream.getTracks().forEach((t) => t.stop());
     document.removeEventListener('keydown', onEsc, true);
     rendering = null;
     $('rvStop').hidden = true;
     $('rvGo').disabled = false;
     if (hideForTake && !wasHidden) setHidden(false);
+    if (hideForTake && wasPopped) popOut();
     seek(0);
 
     if (aborted || !blob.size) {
@@ -4053,27 +4037,8 @@
     a.download = `${name}.${ext}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    console.log(`[animlab] rendered ${round(total)}s, ${(blob.size / 1048576).toFixed(1)} MB, ${src.kind} capture`);
+    console.log(`[animlab] rendered ${round(total)}s, ${(blob.size / 1048576).toFixed(1)} MB`);
   }
-
-  function describeSource() {
-    const kind = $('rvSource').value;
-    const c = canvasFor(selectedEl || 'body') || document.querySelector('canvas');
-    if (kind === 'screen') {
-      $('rvHint').textContent =
-        'you will be asked which surface to share. the panel hides itself for the take. esc aborts.';
-    } else if (c) {
-      $('rvHint').textContent =
-        `captures <canvas> ${c.width}×${c.height} directly. exact pixels, no share prompt, ` +
-        'and the panel never appears in frame. dom outside the canvas will not be recorded.';
-    } else {
-      $('rvHint').textContent = kind === 'canvas'
-        ? 'no canvas under the selected target. pick one, or switch to screen capture.'
-        : 'no canvas found, so this will fall back to screen capture.';
-    }
-  }
-  $('rvSource').addEventListener('change', describeSource);
-  describeSource();
 
   $('audPick').addEventListener('click', () => $('audIn').click());
   $('audIn').addEventListener('change', async (e) => {
@@ -4174,7 +4139,9 @@
 
   function setHidden(v) {
     hidden = v;
-    host.style.display = v ? 'none' : 'block';
+    // important, so a page stylesheet reaching into the host cannot override it
+    if (v) host.style.setProperty('display', 'none', 'important');
+    else host.style.removeProperty('display');
     hi.style.display = 'none';
   }
 
@@ -4261,6 +4228,7 @@
     host.classList.add(mode);
     if (popup) {
       host.style.cssText = 'position:absolute;inset:0;pointer-events:auto;';
+      if (hidden) host.style.setProperty('display', 'none', 'important');
       return;
     }
     const base = 'position:fixed;z-index:2147483646;pointer-events:none;';
@@ -4275,6 +4243,9 @@
       const y = Math.max(0, Math.min(floatBox.y, window.innerHeight - h));
       host.style.cssText = base + `left:${x}px;top:${y}px;right:auto;bottom:auto;width:${w}px;height:${h}px;`;
     }
+    // cssText above wipes the inline display, so a hidden panel would pop back
+    // into view. mid-render that means the panel lands in the video.
+    if (hidden) host.style.setProperty('display', 'none', 'important');
     try { localStorage.setItem('animlab:layout', JSON.stringify({ mode, dockH, floatBox })); } catch (_) {}
   }
 
@@ -4518,7 +4489,7 @@
       if (actx) { try { actx.close(); } catch (_) {} }
       if (rendering) {
         try { rendering.rec.stop(); } catch (_) {}
-        rendering.src.stream.getTracks().forEach((t) => t.stop());
+        rendering.stream.getTracks().forEach((t) => t.stop());
         rendering = null;
       }
       unbindDoc(document);
